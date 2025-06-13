@@ -4,24 +4,16 @@ const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@deepgram/sdk');
 const twilio = require('twilio');
-const { twiml } = require('twilio');
-const fetch = require('node-fetch'); // v2 for compatibility
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-// Deepgram setup
 const dgClient = createClient(process.env.DEEPGRAM_API_KEY);
-
-// Twilio setup
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Middlewares
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
 
-// Outbound call (for demo/testing)
 app.get('/call-me', async (req, res) => {
   try {
     const call = await client.calls.create({
@@ -38,7 +30,6 @@ app.get('/call-me', async (req, res) => {
   }
 });
 
-// Twilio webhook to start <Stream>
 app.all('/twiml', (req, res) => {
   const xml = `
     <Response>
@@ -53,37 +44,16 @@ app.all('/twiml', (req, res) => {
   res.send(xml);
 });
 
-// Handle Twilio stream skips/failures
-app.post('/stream-skipped', (req, res) => {
-  console.log('⚠️ Twilio skipped the <Stream> or failed to open WebSocket');
-  const response = new twiml.VoiceResponse();
-  response.say("Sorry, something went wrong with the call stream.");
-  res.type('text/xml').send(response.toString());
-});
-
-// Health check
-app.get('/ping', (req, res) => res.send('pong'));
-
-// Mu-law decoding (pure JS, no npm needed)
-function mulawDecode(muLawByte) {
-  const MULAW_MAX = 0x1FFF;
-  const MULAW_BIAS = 33;
-  muLawByte = ~muLawByte;
-  let sign = (muLawByte & 0x80) ? -1 : 1;
-  let exponent = (muLawByte >> 4) & 0x07;
-  let mantissa = muLawByte & 0x0F;
-  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-  return sign * (sample - MULAW_BIAS);
-}
-
-// WebSocket for Twilio <Stream>
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio stream connected');
 
-  // Connect to Deepgram live streaming
+  // 🔑 This is the fix: Use encoding: 'mulaw', sample_rate: 8000
   const dgStream = await dgClient.listen.live({
     model: 'nova',
     interim_results: true,
+    encoding: 'mulaw',
+    sample_rate: 8000,
+    channels: 1,
     language: 'en',
     smart_format: true
   });
@@ -92,7 +62,7 @@ wss.on('connection', async (ws) => {
     if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
       const transcript = data.channel.alternatives[0].transcript;
       console.log('🗣 Final transcript:', transcript);
-      // TODO: Plug in OpenAI/ElevenLabs pipeline here if needed
+      // Plug your OpenAI/ElevenLabs logic here
     }
   });
 
@@ -106,15 +76,9 @@ wss.on('connection', async (ws) => {
       if (parsed.event === 'start') {
         console.log('🟢 Twilio stream started');
       } else if (parsed.event === 'media') {
-        // Decode base64 payload (μ-law)
+        // SEND RAW MULAW TO DEEPGRAM:
         const muLawAudio = Buffer.from(parsed.media.payload, 'base64');
-        // Decode μ-law to PCM
-        const pcmSamples = Buffer.alloc(muLawAudio.length * 2);
-        for (let i = 0; i < muLawAudio.length; i++) {
-          const sample = mulawDecode(muLawAudio[i]);
-          pcmSamples.writeInt16LE(sample, i * 2);
-        }
-        dgStream.send(pcmSamples);
+        dgStream.send(muLawAudio);
       } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
         dgStream.finish();
@@ -131,7 +95,6 @@ wss.on('connection', async (ws) => {
   });
 });
 
-// WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -142,7 +105,6 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
