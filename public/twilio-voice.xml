@@ -1,0 +1,6 @@
+<Response>
+  <Start>
+    <Stream url="wss://8380-2a02-8086-cb9-1700-1d4f-fa80-963-86f8.ngrok-free.app/ws" />
+  </Start>
+  <Say>Hi, this is your GP clinic assistant. You may begin speaking.</Say>
+</Response>
