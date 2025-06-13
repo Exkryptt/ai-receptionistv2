@@ -35,7 +35,6 @@ app.all('/twiml', (req, res) => {
   res.send(twimlResponse);
 });
 
-
 app.post('/stream-skipped', (req, res) => {
   console.log('⚠️ Twilio skipped the <Stream> or failed to open WebSocket');
   const response = new twiml.VoiceResponse();
@@ -63,20 +62,16 @@ app.get('/call-me', async (req, res) => {
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio stream connected');
 
-  // Create Deepgram streaming client with explicit encoding and sample rate
+  // Deepgram streaming client with auto detect (removed encoding, sample_rate, channels)
   const dgStream = await dgClient.listen.live({
     model: 'nova',
     interim_results: true,
     language: 'en',
-    smart_format: true,
-    encoding: 'linear16',
-    sample_rate: 16000,
-    channels: 1
+    smart_format: true
   });
 
-  // Debugging: log Deepgram transcripts and errors
   dgStream.on('transcriptReceived', (data) => {
-    console.log('📄 Deepgram transcriptReceived event:', JSON.stringify(data));
+    console.log('📄 Deepgram transcriptReceived event:', JSON.stringify(data, null, 2));
     if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
       console.log('🗣 Final transcript:', data.channel.alternatives[0].transcript);
     }
@@ -86,7 +81,6 @@ wss.on('connection', async (ws) => {
     console.error('❌ Deepgram streaming error:', err);
   });
 
-  // For sending TTS audio back to Twilio
   dgStream.on('close', () => {
     console.log('🛑 Deepgram stream closed');
   });
@@ -95,25 +89,25 @@ wss.on('connection', async (ws) => {
     console.log('🛑 Deepgram stream finished');
   });
 
-  // For throttling media event forwarding to Deepgram: allow once per second
+  // Throttle media events to once per second
   let lastSentTimestamp = 0;
 
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
-      // console.log('📩 Raw event:', parsed.event); // uncomment if you want full raw logs
-
       if (parsed.event === 'start') {
         console.log('🟢 Twilio stream started');
       } else if (parsed.event === 'media') {
         const now = Date.now();
-        // throttle sending audio to Deepgram to roughly 1 per second
         if (now - lastSentTimestamp > 1000) {
           lastSentTimestamp = now;
           const audio = Buffer.from(parsed.media.payload, 'base64');
-          // Send raw audio buffer to Deepgram
-          dgStream.send(audio);
-          console.log('🔊 Sent audio chunk to Deepgram');
+          try {
+            dgStream.send(audio);
+            console.log('🔊 Sent audio chunk to Deepgram');
+          } catch (err) {
+            console.error('❌ Error sending audio to Deepgram:', err);
+          }
         }
       } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
@@ -132,9 +126,9 @@ wss.on('connection', async (ws) => {
     if (dgStream) dgStream.finish();
   });
 
-  // Respond to Deepgram transcripts with OpenAI and send TTS audio back to Twilio
+  // Respond to Deepgram transcripts with OpenAI and ElevenLabs TTS (unchanged)
   dgStream.on('transcriptReceived', async (data) => {
-    if (!data.is_final) return; // only final transcripts
+    if (!data.is_final) return;
 
     const transcript = data.channel?.alternatives?.[0]?.transcript;
     if (!transcript) return;
@@ -153,7 +147,6 @@ wss.on('connection', async (ws) => {
       const reply = gpt.choices[0].message.content;
       console.log('🤖 GPT reply:', reply);
 
-      // ElevenLabs TTS request
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream`, {
         method: 'POST',
         headers: {
@@ -176,7 +169,6 @@ wss.on('connection', async (ws) => {
         return;
       }
 
-      // Convert ElevenLabs audio to raw PCM 16kHz mono using prism + ffmpeg
       const ffmpeg = new prism.FFmpeg({
         args: [
           '-analyzeduration', '0',
@@ -196,9 +188,7 @@ wss.on('connection', async (ws) => {
         const base64Audio = chunk.toString('base64');
         const message = JSON.stringify({
           event: 'media',
-          media: {
-            payload: base64Audio
-          }
+          media: { payload: base64Audio }
         });
         ws.send(message);
       });
