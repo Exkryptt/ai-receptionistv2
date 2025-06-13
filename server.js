@@ -7,11 +7,11 @@ const { createClient } = require('@deepgram/sdk');
 const { OpenAI } = require('openai');
 const twilio = require('twilio');
 const { twiml } = require('twilio');
+const prism = require('prism-media');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
-
 
 const dgClient = createClient(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -22,10 +22,10 @@ app.use(express.static('public'));
 
 // ✅ Dynamic TwiML for Twilio
 app.all('/twiml', (req, res) => {
-  const twiml = `
+  const twimlResponse = `
     <Response>
       <Start>
-        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" content-type="audio/l16;rate=16000;channels=1" />
+        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" />
       </Start>
       <Say>Hi, this is your GP clinic assistant. Please begin speaking after the beep.</Say>
       <Pause length="6"/>
@@ -33,10 +33,8 @@ app.all('/twiml', (req, res) => {
     </Response>
   `;
   res.set('Content-Type', 'text/xml');
-  res.send(twiml);
+  res.send(twimlResponse);
 });
-
-
 
 app.post('/stream-skipped', (req, res) => {
   console.log('⚠️ Twilio skipped the <Stream> or failed to open WebSocket');
@@ -44,8 +42,6 @@ app.post('/stream-skipped', (req, res) => {
   response.say("Sorry, something went wrong with the call stream.");
   res.type('text/xml').send(response.toString());
 });
-
-
 
 // ✅ Call trigger
 app.get('/call-me', async (req, res) => {
@@ -91,7 +87,8 @@ wss.on('connection', async (ws) => {
     const reply = gpt.choices[0].message.content;
     console.log('🤖', reply);
 
-    const audioRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream`, {
+    // Fetch ElevenLabs TTS stream
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream`, {
       method: 'POST',
       headers: {
         'xi-api-key': process.env.ELEVENLABS_API_KEY,
@@ -108,7 +105,45 @@ wss.on('connection', async (ws) => {
       })
     });
 
-    console.log('🔊 ElevenLabs stream received (not yet streamed back to caller)');
+    if (!response.ok) {
+      console.error('❌ ElevenLabs TTS request failed');
+      return;
+    }
+
+    // Use prism-media + ffmpeg to convert audio to PCM 16kHz mono 16-bit
+    const ffmpeg = new prism.FFmpeg({
+      args: [
+        '-analyzeduration', '0',
+        '-loglevel', '0',
+        '-f', 'wav',
+        '-i', 'pipe:0',
+        '-f', 's16le',
+        '-ar', '16000',
+        '-ac', '1',
+        'pipe:1'
+      ],
+    });
+
+    response.body.pipe(ffmpeg);
+
+    ffmpeg.on('data', (chunk) => {
+      const base64Audio = chunk.toString('base64');
+      const message = JSON.stringify({
+        event: 'media',
+        media: {
+          payload: base64Audio
+        }
+      });
+      ws.send(message);
+    });
+
+    ffmpeg.on('end', () => {
+      console.log('🔊 Finished sending TTS audio');
+    });
+
+    ffmpeg.on('error', (err) => {
+      console.error('❌ FFmpeg error:', err);
+    });
   });
 
   ws.on('message', (msg) => {
@@ -129,11 +164,12 @@ wss.on('connection', async (ws) => {
     console.error('❌ WebSocket error:', err);
   });
 
-ws.on('close', () => {
-  console.log('❌ WebSocket closed');
-  if (dgStream) dgStream.finish();
+  ws.on('close', () => {
+    console.log('❌ WebSocket closed');
+    if (dgStream) dgStream.finish();
+  });
 });
-});
+
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -143,6 +179,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
   }
 });
+
 app.get('/ping', (req, res) => {
   res.send('pong');
 });
