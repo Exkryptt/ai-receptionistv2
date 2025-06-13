@@ -3,111 +3,147 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@deepgram/sdk');
-const { OpenAI } = require('openai');
 const twilio = require('twilio');
-const bodyParser = require('body-parser');
+const { twiml } = require('twilio');
+const fetch = require('node-fetch'); // v2 for compatibility
 
-const PORT = process.env.PORT || 10000;
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
+// Deepgram setup
 const dgClient = createClient(process.env.DEEPGRAM_API_KEY);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Twilio setup
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+// Middlewares
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
-app.use(bodyParser.urlencoded({ extended: false }));
 
-// --- μ-law decoder functions ---
-function mulawDecode(uVal) {
-  uVal = ~uVal;
-  let t = ((uVal & 0x0F) << 3) + 0x84;
-  t <<= ((uVal & 0x70) >> 4);
-  return ((uVal & 0x80) ? (0x84 - t) : (t - 0x84));
-}
-function decodeMuLawBuffer(muLawBuf) {
-  const pcm = Buffer.alloc(muLawBuf.length * 2);
-  for (let i = 0; i < muLawBuf.length; i++) {
-    const s = mulawDecode(muLawBuf[i]);
-    pcm.writeInt16LE(s, i * 2);
-  }
-  return pcm;
-}
-
-// --- TwiML endpoint for Twilio calls ---
-app.post('/twiml', (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.start().stream({
-    url: `${process.env.STREAM_URL || 'wss://ai-receptionistv2.onrender.com/ws'}`
-  });
-  twiml.say('Hello, you are speaking to the AI receptionist.');
-  res.type('text/xml');
-  res.send(twiml.toString());
-});
-
-// --- Upgrade HTTP to WebSocket for /ws ---
-server.on('upgrade', (request, socket, head) => {
-  if (request.url === '/ws') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
+// Outbound call (for demo/testing)
+app.get('/call-me', async (req, res) => {
+  try {
+    const call = await client.calls.create({
+      url: `https://${req.headers.host}/twiml`,
+      to: process.env.YOUR_PHONE_NUMBER,
+      from: process.env.TWILIO_NUMBER,
+      method: 'POST'
     });
-  } else {
-    socket.destroy();
+    console.log(`📞 Outbound call started: ${call.sid}`);
+    res.send('Calling your phone now...');
+  } catch (err) {
+    console.error('❌ Call failed:', err);
+    res.status(500).send('Call failed.');
   }
 });
 
-// --- Main WebSocket Handler ---
+// Twilio webhook to start <Stream>
+app.all('/twiml', (req, res) => {
+  const xml = `
+    <Response>
+      <Start>
+        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" />
+      </Start>
+      <Say>Hi, this is your GP clinic assistant. Please begin speaking after the beep.</Say>
+      <Pause length="60"/>
+    </Response>
+  `;
+  res.set('Content-Type', 'text/xml');
+  res.send(xml);
+});
+
+// Handle Twilio stream skips/failures
+app.post('/stream-skipped', (req, res) => {
+  console.log('⚠️ Twilio skipped the <Stream> or failed to open WebSocket');
+  const response = new twiml.VoiceResponse();
+  response.say("Sorry, something went wrong with the call stream.");
+  res.type('text/xml').send(response.toString());
+});
+
+// Health check
+app.get('/ping', (req, res) => res.send('pong'));
+
+// Mu-law decoding (pure JS, no npm needed)
+function mulawDecode(muLawByte) {
+  const MULAW_MAX = 0x1FFF;
+  const MULAW_BIAS = 33;
+  muLawByte = ~muLawByte;
+  let sign = (muLawByte & 0x80) ? -1 : 1;
+  let exponent = (muLawByte >> 4) & 0x07;
+  let mantissa = muLawByte & 0x0F;
+  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
+  return sign * (sample - MULAW_BIAS);
+}
+
+// WebSocket for Twilio <Stream>
 wss.on('connection', async (ws) => {
-  console.log('📞 WebSocket connected');
-  // Create Deepgram live stream
+  console.log('📞 Twilio stream connected');
+
+  // Connect to Deepgram live streaming
   const dgStream = await dgClient.listen.live({
     model: 'nova',
-    encoding: 'linear16',
-    sample_rate: 8000,
     interim_results: true,
-    smart_format: true,
-    language: 'en'
+    language: 'en',
+    smart_format: true
   });
 
-  // Relay Deepgram transcript to console (or handle as needed)
-  dgStream.on('transcriptReceived', (transcript) => {
-    if (transcript.channel && transcript.channel.alternatives && transcript.channel.alternatives[0].transcript) {
-      const msg = transcript.channel.alternatives[0].transcript;
-      if (msg.length) console.log('💬 Deepgram:', msg);
+  dgStream.on('transcriptReceived', (data) => {
+    if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
+      const transcript = data.channel.alternatives[0].transcript;
+      console.log('🗣 Final transcript:', transcript);
+      // TODO: Plug in OpenAI/ElevenLabs pipeline here if needed
     }
   });
-  dgStream.on('error', (err) => {
-    console.error('❌ Deepgram error:', err);
-  });
+
+  dgStream.on('error', (err) => console.error('❌ Deepgram error:', err));
+  dgStream.on('close', () => console.log('🛑 Deepgram stream closed'));
+  dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
 
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
-      if (parsed.event === 'media') {
-        const mulawBuf = Buffer.from(parsed.media.payload, 'base64');
-        const pcm = decodeMuLawBuffer(mulawBuf);
-        if (pcm.length > 0) dgStream.send(pcm);
-      }
       if (parsed.event === 'start') {
         console.log('🟢 Twilio stream started');
-      }
-      if (parsed.event === 'stop') {
+      } else if (parsed.event === 'media') {
+        // Decode base64 payload (μ-law)
+        const muLawAudio = Buffer.from(parsed.media.payload, 'base64');
+        // Decode μ-law to PCM
+        const pcmSamples = Buffer.alloc(muLawAudio.length * 2);
+        for (let i = 0; i < muLawAudio.length; i++) {
+          const sample = mulawDecode(muLawAudio[i]);
+          pcmSamples.writeInt16LE(sample, i * 2);
+        }
+        dgStream.send(pcmSamples);
+      } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
         dgStream.finish();
       }
     } catch (e) {
-      console.error('❌ WebSocket message parse error:', e);
+      console.error('❌ Error parsing WebSocket message:', e);
     }
   });
 
+  ws.on('error', (err) => console.error('❌ WebSocket error:', err));
   ws.on('close', () => {
     console.log('❌ WebSocket closed');
     dgStream.finish();
   });
 });
 
+// WebSocket upgrade
+server.on('upgrade', (req, socket, head) => {
+  if (req.url === '/ws') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🔗 ws://localhost:${PORT}/ws or wss://ai-receptionistv2.onrender.com/ws`);
 });
