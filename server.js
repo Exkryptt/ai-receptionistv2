@@ -90,7 +90,11 @@ wss.on('connection', async (ws) => {
   });
 
   // Opus decoder from prism-media (for Twilio Opus audio)
-  const opusDecoder = new prism.opus.Decoder({ rate: 16000, channels: 1, frameSize: 960 });
+  const opusDecoder = new prism.opus.Decoder({
+    rate: 8000,       // Twilio's Opus stream is usually 8kHz
+    channels: 1,
+    frameSize: 160    // 20ms frame @ 8kHz = 160 samples
+  });
 
   // Pipe decoded PCM chunks to Deepgram
   opusDecoder.on('data', (pcmChunk) => {
@@ -102,6 +106,11 @@ wss.on('connection', async (ws) => {
     }
   });
 
+  // Handle Opus decoder errors to prevent crashing
+  opusDecoder.on('error', (err) => {
+    console.error('❌ Opus decoder error:', err.message);
+  });
+
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
@@ -111,8 +120,11 @@ wss.on('connection', async (ws) => {
         const audio = Buffer.from(parsed.media.payload, 'base64');
         console.log('🔊 Received audio chunk size:', audio.length);
 
-        // Write Opus audio buffer into the decoder stream
-        opusDecoder.write(audio);
+        try {
+          opusDecoder.write(audio);
+        } catch (err) {
+          console.error('❌ Opus decode error:', err.message);
+        }
       } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
       }
