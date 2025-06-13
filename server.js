@@ -92,6 +92,16 @@ wss.on('connection', async (ws) => {
   // Opus decoder from prism-media (for Twilio Opus audio)
   const opusDecoder = new prism.opus.Decoder({ rate: 16000, channels: 1, frameSize: 960 });
 
+  // Pipe decoded PCM chunks to Deepgram
+  opusDecoder.on('data', (pcmChunk) => {
+    try {
+      dgStream.send(pcmChunk);
+      console.log('✅ Sent decoded PCM audio chunk to Deepgram');
+    } catch (err) {
+      console.error('❌ Error sending audio to Deepgram:', err);
+    }
+  });
+
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
@@ -101,15 +111,8 @@ wss.on('connection', async (ws) => {
         const audio = Buffer.from(parsed.media.payload, 'base64');
         console.log('🔊 Received audio chunk size:', audio.length);
 
-        // Decode Opus audio to PCM
-        const pcmAudio = opusDecoder.decode(audio);
-
-        try {
-          dgStream.send(pcmAudio);
-          console.log('✅ Sent decoded PCM audio chunk to Deepgram');
-        } catch (err) {
-          console.error('❌ Error sending audio to Deepgram:', err);
-        }
+        // Write Opus audio buffer into the decoder stream
+        opusDecoder.write(audio);
       } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
       }
