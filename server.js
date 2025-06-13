@@ -25,7 +25,7 @@ app.all('/twiml', (req, res) => {
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://ai-receptionistv2.onrender.com/ws" track="inbound_audio" content-type="audio/l16;rate=16000;channels=1" />
+        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" content-type="audio/l16;rate=16000;channels=1" />
       </Start>
       <Say>Hi, this is your GP clinic assistant. Please begin speaking after the beep.</Say>
       <Pause length="6"/>
@@ -35,6 +35,7 @@ app.all('/twiml', (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send(twiml);
 });
+
 
 
 app.post('/stream-skipped', (req, res) => {
