@@ -14,7 +14,6 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 
 app.use(express.urlencoded({ extended: true }));
 
-// Call-Me endpoint for testing
 app.get('/call-me', async (req, res) => {
   try {
     const call = await client.calls.create({
@@ -31,7 +30,6 @@ app.get('/call-me', async (req, res) => {
   }
 });
 
-// Twilio webhook to initiate the <Stream>
 app.all('/twiml', (req, res) => {
   const xml = `
     <Response>
@@ -50,8 +48,8 @@ wss.on('connection', async (ws, req) => {
   console.log('==> ///////////////////////////////////////////////////////////');
   console.log('📞 Twilio WebSocket stream connected');
 
-  // Create Deepgram live stream
   let dgStream;
+  let streamClosed = false;
   try {
     dgStream = await dgClient.listen.live({
       encoding: 'mulaw',
@@ -60,7 +58,7 @@ wss.on('connection', async (ws, req) => {
       language: 'en',
       smart_format: true,
     });
-    console.log('🔗 Deepgram live stream started');
+    console.log('🔗 Deepgram live stream started (encoding: mulaw, sample_rate: 8000)');
   } catch (err) {
     console.error('❌ Failed to start Deepgram stream:', err);
     ws.close();
@@ -69,17 +67,30 @@ wss.on('connection', async (ws, req) => {
 
   // Deepgram event listeners
   dgStream.on('transcriptReceived', (data) => {
-    if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
+    if (data.channel?.alternatives?.[0]?.transcript) {
       const transcript = data.channel.alternatives[0].transcript;
-      console.log('🗣 Final transcript:', transcript);
-      // Insert your OpenAI/ElevenLabs logic here
+      if (data.is_final) {
+        console.log('🗣 Final transcript:', transcript);
+        // TODO: Integrate OpenAI/ElevenLabs here
+      } else {
+        console.log('... Interim:', transcript);
+      }
+    } else {
+      console.log('🔇 Deepgram: No transcript received in this chunk.');
     }
   });
   dgStream.on('error', (err) => console.error('❌ Deepgram error:', err));
   dgStream.on('close', () => console.log('🛑 Deepgram stream closed'));
   dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
 
-  // Twilio events from WebSocket
+  function cleanupDeepgram() {
+    if (!streamClosed) {
+      streamClosed = true;
+      try { dgStream.finish(); } catch (e) {}
+      console.log('🧹 Deepgram cleanup triggered.');
+    }
+  }
+
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
@@ -91,14 +102,13 @@ wss.on('connection', async (ws, req) => {
           console.log(`🟢 [Twilio] stream started: ${msg}`);
           break;
         case 'media':
-          // Receive media in base64, decode, send to Deepgram as binary buffer
           const audio = Buffer.from(parsed.media.payload, 'base64');
-          console.log(`[media] got ${audio.length} bytes from Twilio`);
-          dgStream.write(audio);
+          console.log(`[media] got ${audio.length} bytes from Twilio (forwarding to Deepgram)`);
+          dgStream.send(audio);
           break;
         case 'stop':
           console.log('🛑 [Twilio] stream stopped');
-          dgStream.end();
+          cleanupDeepgram();
           break;
         default:
           console.log(`[Twilio] Unhandled event: ${msg}`);
@@ -110,16 +120,15 @@ wss.on('connection', async (ws, req) => {
 
   ws.on('error', (err) => {
     console.error('❌ WebSocket error:', err);
-    dgStream.end();
+    cleanupDeepgram();
   });
 
   ws.on('close', () => {
     console.log('❌ WebSocket closed');
-    dgStream.end();
+    cleanupDeepgram();
   });
 });
 
-// HTTP upgrade handler for /ws
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
