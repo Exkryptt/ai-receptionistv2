@@ -14,13 +14,14 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 
 app.use(express.urlencoded({ extended: true }));
 
+// Call-Me endpoint for testing
 app.get('/call-me', async (req, res) => {
   try {
     const call = await client.calls.create({
       url: `https://${req.headers.host}/twiml`,
       to: process.env.YOUR_PHONE_NUMBER,
       from: process.env.TWILIO_NUMBER,
-      method: 'POST'
+      method: 'POST',
     });
     console.log(`📞 Outbound call started: ${call.sid}`);
     res.send('Calling your phone now...');
@@ -30,6 +31,7 @@ app.get('/call-me', async (req, res) => {
   }
 });
 
+// Twilio webhook to initiate the <Stream>
 app.all('/twiml', (req, res) => {
   const xml = `
     <Response>
@@ -45,66 +47,79 @@ app.all('/twiml', (req, res) => {
 });
 
 wss.on('connection', async (ws, req) => {
-  console.log('📞 Twilio stream connected');
+  console.log('==> ///////////////////////////////////////////////////////////');
+  console.log('📞 Twilio WebSocket stream connected');
 
+  // Create Deepgram live stream
   let dgStream;
   try {
     dgStream = await dgClient.listen.live({
-      model: 'nova',
-      interim_results: true,
       encoding: 'mulaw',
       sample_rate: 8000,
-      channels: 1,
+      interim_results: true,
       language: 'en',
-      smart_format: true
+      smart_format: true,
     });
     console.log('🔗 Deepgram live stream started');
   } catch (err) {
-    console.error('❌ Deepgram live stream failed:', err);
+    console.error('❌ Failed to start Deepgram stream:', err);
     ws.close();
     return;
   }
 
+  // Deepgram event listeners
   dgStream.on('transcriptReceived', (data) => {
-    console.log('⬇️ [Deepgram] transcriptReceived:', JSON.stringify(data));
     if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
       const transcript = data.channel.alternatives[0].transcript;
       console.log('🗣 Final transcript:', transcript);
-      // Plug your OpenAI/ElevenLabs logic here
+      // Insert your OpenAI/ElevenLabs logic here
     }
   });
+  dgStream.on('error', (err) => console.error('❌ Deepgram error:', err));
+  dgStream.on('close', () => console.log('🛑 Deepgram stream closed'));
+  dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
 
-  dgStream.on('error', (err) => console.error('❌ [Deepgram] Error:', err));
-  dgStream.on('close', () => console.log('🛑 [Deepgram] Stream closed'));
-  dgStream.on('finish', () => console.log('🛑 [Deepgram] Stream finished'));
-
+  // Twilio events from WebSocket
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
-      if (parsed.event === 'start') {
-        console.log('🟢 [Twilio] stream started:', JSON.stringify(parsed));
-      } else if (parsed.event === 'media') {
-        const muLawAudio = Buffer.from(parsed.media.payload, 'base64');
-        console.log(`[media] got ${muLawAudio.length} bytes from Twilio`);
-        dgStream.send(muLawAudio);
-      } else if (parsed.event === 'stop') {
-        console.log('🛑 [Twilio] stream stopped:', JSON.stringify(parsed));
-        dgStream.finish();
-      } else {
-        console.log('[Twilio] Unhandled event:', JSON.stringify(parsed));
+      switch (parsed.event) {
+        case 'connected':
+          console.log(`[Twilio] Unhandled event: ${msg}`);
+          break;
+        case 'start':
+          console.log(`🟢 [Twilio] stream started: ${msg}`);
+          break;
+        case 'media':
+          // Receive media in base64, decode, send to Deepgram as binary buffer
+          const audio = Buffer.from(parsed.media.payload, 'base64');
+          console.log(`[media] got ${audio.length} bytes from Twilio`);
+          dgStream.write(audio);
+          break;
+        case 'stop':
+          console.log('🛑 [Twilio] stream stopped');
+          dgStream.end();
+          break;
+        default:
+          console.log(`[Twilio] Unhandled event: ${msg}`);
       }
     } catch (e) {
-      console.error('❌ Error parsing WebSocket message:', e, msg);
+      console.error('❌ Error parsing WebSocket message:', e);
     }
   });
 
-  ws.on('error', (err) => console.error('❌ [WebSocket] error:', err));
+  ws.on('error', (err) => {
+    console.error('❌ WebSocket error:', err);
+    dgStream.end();
+  });
+
   ws.on('close', () => {
-    console.log('❌ [WebSocket] closed');
-    if (dgStream) dgStream.finish();
+    console.log('❌ WebSocket closed');
+    dgStream.end();
   });
 });
 
+// HTTP upgrade handler for /ws
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -118,4 +133,6 @@ server.on('upgrade', (req, socket, head) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
+  console.log('==> ///////////////////////////////////////////////////////////');
+  console.log('==> Available at your primary URL');
 });
