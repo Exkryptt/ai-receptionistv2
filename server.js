@@ -20,12 +20,12 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// TwiML for Twilio — keeps stream open
+// TwiML for Twilio — keeps stream open, no content-type forcing
 app.all('/twiml', (req, res) => {
   const twimlResponse = `
     <Response>
       <Start>
-        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" content-type="audio/l16;rate=16000;channels=1" />
+        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" />
       </Start>
       <Say>Hi, this is your GP clinic assistant. Please begin speaking after the beep.</Say>
       <Pause length="60"/>
@@ -46,7 +46,7 @@ app.post('/stream-skipped', (req, res) => {
 app.get('/call-me', async (req, res) => {
   try {
     const call = await client.calls.create({
-      url: 'https://ai-receptionistv2.onrender.com/twiml',
+      url: `https://${req.headers.host}/twiml`,
       to: process.env.YOUR_PHONE_NUMBER,
       from: process.env.TWILIO_NUMBER,
       method: 'POST'
@@ -62,7 +62,7 @@ app.get('/call-me', async (req, res) => {
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio stream connected');
 
-  // Deepgram streaming client with auto detect (removed encoding, sample_rate, channels)
+  // Create Deepgram streaming client with auto-detect encoding
   const dgStream = await dgClient.listen.live({
     model: 'nova',
     interim_results: true,
@@ -89,8 +89,8 @@ wss.on('connection', async (ws) => {
     console.log('🛑 Deepgram stream finished');
   });
 
-  // Throttle media events to once per second
-  let lastSentTimestamp = 0;
+  // Opus decoder from prism-media (for Twilio Opus audio)
+  const opusDecoder = new prism.opus.Decoder({ rate: 16000, channels: 1, frameSize: 960 });
 
   ws.on('message', (msg) => {
     try {
@@ -98,16 +98,17 @@ wss.on('connection', async (ws) => {
       if (parsed.event === 'start') {
         console.log('🟢 Twilio stream started');
       } else if (parsed.event === 'media') {
-        const now = Date.now();
-        if (now - lastSentTimestamp > 1000) {
-          lastSentTimestamp = now;
-          const audio = Buffer.from(parsed.media.payload, 'base64');
-          try {
-            dgStream.send(audio);
-            console.log('🔊 Sent audio chunk to Deepgram');
-          } catch (err) {
-            console.error('❌ Error sending audio to Deepgram:', err);
-          }
+        const audio = Buffer.from(parsed.media.payload, 'base64');
+        console.log('🔊 Received audio chunk size:', audio.length);
+
+        // Decode Opus audio to PCM
+        const pcmAudio = opusDecoder.decode(audio);
+
+        try {
+          dgStream.send(pcmAudio);
+          console.log('✅ Sent decoded PCM audio chunk to Deepgram');
+        } catch (err) {
+          console.error('❌ Error sending audio to Deepgram:', err);
         }
       } else if (parsed.event === 'stop') {
         console.log('🛑 Twilio stream stopped');
@@ -126,7 +127,7 @@ wss.on('connection', async (ws) => {
     if (dgStream) dgStream.finish();
   });
 
-  // Respond to Deepgram transcripts with OpenAI and ElevenLabs TTS (unchanged)
+  // Respond to Deepgram transcripts with OpenAI and ElevenLabs TTS
   dgStream.on('transcriptReceived', async (data) => {
     if (!data.is_final) return;
 
