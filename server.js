@@ -49,7 +49,7 @@ app.post('/stream-skipped', (req, res) => {
 app.get('/call-me', async (req, res) => {
   try {
     const call = await client.calls.create({
-      url: 'https://4679-2a02-8086-cb9-1700-1d4f-fa80-963-86f8.ngrok-free.app/twiml',
+      url: 'https://ai-receptionistv2.onrender.com/twiml',
       to: process.env.YOUR_PHONE_NUMBER,
       from: process.env.TWILIO_NUMBER,
       method: 'POST'
@@ -127,10 +127,10 @@ wss.on('connection', async (ws) => {
     console.error('❌ WebSocket error:', err);
   });
 
-  ws.on('close', () => {
-    console.log('❌ WebSocket closed');
-    dgStream.finish();
-  });
+ws.on('close', () => {
+  console.log('❌ WebSocket closed');
+  if (dgStream) dgStream.finish();
+});
 });
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
@@ -141,8 +141,11 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
   }
 });
+app.get('/ping', (req, res) => {
+  res.send('pong');
+});
 
-
-server.listen(3000, () => {
-  console.log('✅ Server running at http://localhost:3000');
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
 });
