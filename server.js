@@ -44,21 +44,29 @@ app.all('/twiml', (req, res) => {
   res.send(xml);
 });
 
-wss.on('connection', async (ws) => {
+wss.on('connection', async (ws, req) => {
   console.log('📞 Twilio stream connected');
 
-  // 🔑 This is the fix: Use encoding: 'mulaw', sample_rate: 8000
-  const dgStream = await dgClient.listen.live({
-    model: 'nova',
-    interim_results: true,
-    encoding: 'mulaw',
-    sample_rate: 8000,
-    channels: 1,
-    language: 'en',
-    smart_format: true
-  });
+  let dgStream;
+  try {
+    dgStream = await dgClient.listen.live({
+      model: 'nova',
+      interim_results: true,
+      encoding: 'mulaw',
+      sample_rate: 8000,
+      channels: 1,
+      language: 'en',
+      smart_format: true
+    });
+    console.log('🔗 Deepgram live stream started');
+  } catch (err) {
+    console.error('❌ Deepgram live stream failed:', err);
+    ws.close();
+    return;
+  }
 
   dgStream.on('transcriptReceived', (data) => {
+    console.log('⬇️ [Deepgram] transcriptReceived:', JSON.stringify(data));
     if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
       const transcript = data.channel.alternatives[0].transcript;
       console.log('🗣 Final transcript:', transcript);
@@ -66,32 +74,34 @@ wss.on('connection', async (ws) => {
     }
   });
 
-  dgStream.on('error', (err) => console.error('❌ Deepgram error:', err));
-  dgStream.on('close', () => console.log('🛑 Deepgram stream closed'));
-  dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
+  dgStream.on('error', (err) => console.error('❌ [Deepgram] Error:', err));
+  dgStream.on('close', () => console.log('🛑 [Deepgram] Stream closed'));
+  dgStream.on('finish', () => console.log('🛑 [Deepgram] Stream finished'));
 
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
       if (parsed.event === 'start') {
-        console.log('🟢 Twilio stream started');
+        console.log('🟢 [Twilio] stream started:', JSON.stringify(parsed));
       } else if (parsed.event === 'media') {
-        // SEND RAW MULAW TO DEEPGRAM:
         const muLawAudio = Buffer.from(parsed.media.payload, 'base64');
+        console.log(`[media] got ${muLawAudio.length} bytes from Twilio`);
         dgStream.send(muLawAudio);
       } else if (parsed.event === 'stop') {
-        console.log('🛑 Twilio stream stopped');
+        console.log('🛑 [Twilio] stream stopped:', JSON.stringify(parsed));
         dgStream.finish();
+      } else {
+        console.log('[Twilio] Unhandled event:', JSON.stringify(parsed));
       }
     } catch (e) {
-      console.error('❌ Error parsing WebSocket message:', e);
+      console.error('❌ Error parsing WebSocket message:', e, msg);
     }
   });
 
-  ws.on('error', (err) => console.error('❌ WebSocket error:', err));
+  ws.on('error', (err) => console.error('❌ [WebSocket] error:', err));
   ws.on('close', () => {
-    console.log('❌ WebSocket closed');
-    dgStream.finish();
+    console.log('❌ [WebSocket] closed');
+    if (dgStream) dgStream.finish();
   });
 });
 
