@@ -7,7 +7,6 @@ const { createClient } = require('@deepgram/sdk');
 const { OpenAI } = require('openai');
 const twilio = require('twilio');
 const { twiml } = require('twilio');
-const prism = require('prism-media');
 
 const app = express();
 const server = http.createServer(app);
@@ -19,6 +18,28 @@ const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TO
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
+
+// --- μ-law (PCMU) decoding functions --- //
+function mulawToLinear(sample) {
+  // From ITU-T G.711 recommendation
+  const MULAW_MAX = 0x1FFF;
+  const MULAW_BIAS = 33;
+  sample = ~sample;
+  let sign = (sample & 0x80) ? -1 : 1;
+  let exponent = (sample >> 4) & 0x07;
+  let mantissa = sample & 0x0F;
+  let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
+  magnitude -= MULAW_BIAS;
+  return sign * magnitude;
+}
+function mulawBufferToPCM16(mulawBuffer) {
+  const pcmBuffer = Buffer.alloc(mulawBuffer.length * 2);
+  for (let i = 0; i < mulawBuffer.length; i++) {
+    let pcmSample = mulawToLinear(mulawBuffer[i]);
+    pcmBuffer.writeInt16LE(pcmSample, i * 2);
+  }
+  return pcmBuffer;
+}
 
 // TwiML for Twilio — keeps stream open, no content-type forcing
 app.all('/twiml', (req, res) => {
@@ -62,7 +83,7 @@ app.get('/call-me', async (req, res) => {
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio stream connected');
 
-  // Create Deepgram streaming client with auto-detect encoding
+  // Create Deepgram streaming client
   const dgStream = await dgClient.listen.live({
     model: 'nova',
     interim_results: true,
@@ -70,85 +91,10 @@ wss.on('connection', async (ws) => {
     smart_format: true
   });
 
-  dgStream.on('transcriptReceived', (data) => {
-    console.log('📄 Deepgram transcriptReceived event:', JSON.stringify(data, null, 2));
-    if (data.channel?.alternatives?.[0]?.transcript && data.is_final) {
-      console.log('🗣 Final transcript:', data.channel.alternatives[0].transcript);
-    }
-  });
-
-  dgStream.on('error', (err) => {
-    console.error('❌ Deepgram streaming error:', err);
-  });
-
-  dgStream.on('close', () => {
-    console.log('🛑 Deepgram stream closed');
-  });
-
-  dgStream.on('finish', () => {
-    console.log('🛑 Deepgram stream finished');
-  });
-
-  // Opus decoder from prism-media (for Twilio Opus audio)
-  const opusDecoder = new prism.opus.Decoder({
-    rate: 8000,       // Twilio's Opus stream is usually 8kHz
-    channels: 1,
-    frameSize: 160    // 20ms frame @ 8kHz = 160 samples
-  });
-
-  // Pipe decoded PCM chunks to Deepgram
-  opusDecoder.on('data', (pcmChunk) => {
-    try {
-      dgStream.send(pcmChunk);
-      console.log('✅ Sent decoded PCM audio chunk to Deepgram');
-    } catch (err) {
-      console.error('❌ Error sending audio to Deepgram:', err);
-    }
-  });
-
-  // Handle Opus decoder errors to prevent crashing
-  opusDecoder.on('error', (err) => {
-    console.error('❌ Opus decoder error:', err.message);
-  });
-
-  ws.on('message', (msg) => {
-    try {
-      const parsed = JSON.parse(msg);
-      if (parsed.event === 'start') {
-        console.log('🟢 Twilio stream started');
-      } else if (parsed.event === 'media') {
-        const audio = Buffer.from(parsed.media.payload, 'base64');
-        console.log('🔊 Received audio chunk size:', audio.length);
-
-        try {
-          opusDecoder.write(audio);
-        } catch (err) {
-          console.error('❌ Opus decode error:', err.message);
-        }
-      } else if (parsed.event === 'stop') {
-        console.log('🛑 Twilio stream stopped');
-      }
-    } catch (e) {
-      console.error('❌ Error parsing WebSocket message:', e);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error('❌ WebSocket error:', err);
-  });
-
-  ws.on('close', () => {
-    console.log('❌ WebSocket closed');
-    if (dgStream) dgStream.finish();
-  });
-
-  // Respond to Deepgram transcripts with OpenAI and ElevenLabs TTS
   dgStream.on('transcriptReceived', async (data) => {
     if (!data.is_final) return;
-
     const transcript = data.channel?.alternatives?.[0]?.transcript;
     if (!transcript) return;
-
     console.log('🗣 Transcript (final):', transcript);
 
     try {
@@ -163,6 +109,7 @@ wss.on('connection', async (ws) => {
       const reply = gpt.choices[0].message.content;
       console.log('🤖 GPT reply:', reply);
 
+      // ElevenLabs TTS
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}/stream`, {
         method: 'POST',
         headers: {
@@ -185,22 +132,8 @@ wss.on('connection', async (ws) => {
         return;
       }
 
-      const ffmpeg = new prism.FFmpeg({
-        args: [
-          '-analyzeduration', '0',
-          '-loglevel', '0',
-          '-f', 'wav',
-          '-i', 'pipe:0',
-          '-f', 's16le',
-          '-ar', '16000',
-          '-ac', '1',
-          'pipe:1'
-        ],
-      });
-
-      response.body.pipe(ffmpeg);
-
-      ffmpeg.on('data', (chunk) => {
+      // Stream TTS audio back to Twilio
+      response.body.on('data', (chunk) => {
         const base64Audio = chunk.toString('base64');
         const message = JSON.stringify({
           event: 'media',
@@ -209,16 +142,57 @@ wss.on('connection', async (ws) => {
         ws.send(message);
       });
 
-      ffmpeg.on('end', () => {
+      response.body.on('end', () => {
         console.log('🔊 Finished sending TTS audio');
       });
 
-      ffmpeg.on('error', (err) => {
-        console.error('❌ FFmpeg error:', err);
+      response.body.on('error', (err) => {
+        console.error('❌ ElevenLabs stream error:', err);
       });
     } catch (err) {
       console.error('❌ Error in GPT or TTS pipeline:', err);
     }
+  });
+
+  dgStream.on('error', (err) => {
+    console.error('❌ Deepgram streaming error:', err);
+  });
+  dgStream.on('close', () => {
+    console.log('🛑 Deepgram stream closed');
+  });
+  dgStream.on('finish', () => {
+    console.log('🛑 Deepgram stream finished');
+  });
+
+  ws.on('message', (msg) => {
+    try {
+      const parsed = JSON.parse(msg);
+      if (parsed.event === 'start') {
+        console.log('🟢 Twilio stream started');
+      } else if (parsed.event === 'media') {
+        // μ-law decode
+        const mulawBuffer = Buffer.from(parsed.media.payload, 'base64');
+        const pcmBuffer = mulawBufferToPCM16(mulawBuffer);
+        try {
+          dgStream.send(pcmBuffer);
+        } catch (err) {
+          console.error('❌ Error sending PCM to Deepgram:', err);
+        }
+      } else if (parsed.event === 'stop') {
+        console.log('🛑 Twilio stream stopped');
+      }
+    } catch (e) {
+      console.error('❌ Error parsing WebSocket message:', e);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error('❌ WebSocket error:', err);
+  });
+
+  ws.on('close', () => {
+    console.log('❌ WebSocket closed');
+    if (dgStream) dgStream.finish();
   });
 });
 
