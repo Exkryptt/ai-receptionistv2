@@ -13,7 +13,7 @@ const axios         = require('axios');
 ////////////////////////////////////////////////////////////////////////////////
 
 const {
-  PORT            = 3000,
+  PORT: ENV_PORT,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   YOUR_PHONE_NUMBER,
@@ -24,11 +24,17 @@ const {
   ELEVENLABS_VOICE_ID
 } = process.env;
 
+// Coerce PORT to a valid integer, fallback to 3000
+const PORT = (() => {
+  const p = parseInt(ENV_PORT, 10);
+  return Number.isInteger(p) && p > 0 && p < 65536 ? p : 3000;
+})();
+
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN ||
     !YOUR_PHONE_NUMBER    || !TWILIO_NUMBER      ||
     !DEEPGRAM_API_KEY     || !OPENAI_API_KEY     ||
     !ELEVENLABS_API_KEY   || !ELEVENLABS_VOICE_ID) {
-  console.error('⚠️  Missing one or more required env vars.');
+  console.error('⚠️  Missing one or more required environment variables.');
   process.exit(1);
 }
 
@@ -43,7 +49,7 @@ const twilioCli = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// 1) TwiML for inbound & streaming
+// TwiML for incoming calls
 app.post('/twiml', (req, res) => {
   res.type('xml').send(`
     <Response>
@@ -56,14 +62,14 @@ app.post('/twiml', (req, res) => {
   `);
 });
 
-// 2) Outbound dialer
+// Outbound dialing endpoint
 app.get('/call-me', async (req, res) => {
   try {
     const call = await twilioCli.calls.create({
-      url:  `https://${req.headers.host}/twiml`,
-      to:   YOUR_PHONE_NUMBER,
-      from: TWILIO_NUMBER,
-      method: 'POST'
+      url:    `https://${req.headers.host}/twiml`,
+      to:     YOUR_PHONE_NUMBER,
+      from:   TWILIO_NUMBER,
+      method: 'POST',
     });
     console.log('📞 Outbound call started:', call.sid);
     res.send('Calling now…');
@@ -80,28 +86,29 @@ app.get('/call-me', async (req, res) => {
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ noServer: true });
 
-// In-memory chat history per callSid
+// Maintain session state per WebSocket
 const sessions = new Map();
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   console.log('📞 New Twilio media stream connected');
+
   const session = {
     dgStream:       null,
     lastTranscript: '',
-    queue:          Promise.resolve(),  // serialize outbound audio
+    queue:          Promise.resolve(),
     chatHistory:    [{ role: 'system',
-      content: `You work at a London Sandwich Bar… ask name & pickup time first, upsell specials, ≤20 words.` }]
+      content: `You work at a London Sandwich Bar and you're answering the phone taking people's takeaway orders. Always ask for caller’s name and pickup time first, upsell the special, keep responses ≤20 words.` }]
   };
   sessions.set(ws, session);
 
-  // Clean-up helper
+  // Clean up on end
   const cleanup = () => {
     if (session.dgStream) session.dgStream.finish();
     sessions.delete(ws);
     console.log('🧹 Session cleaned up');
   };
 
-  // 1) Start Deepgram STT
+  // 1) Open Deepgram STT
   (async () => {
     try {
       session.dgStream = await dgClient.listen.live({
@@ -118,7 +125,7 @@ wss.on('connection', (ws, req) => {
     }
   })();
 
-  // 2) Handle transcripts
+  // 2) Handle transcription events
   const onTranscript = async (evt) => {
     const alt = evt.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
@@ -136,11 +143,11 @@ wss.on('connection', (ws, req) => {
       console.log('🛑 Final:', text);
       session.lastTranscript = '';
 
-      // Build messages for OpenAI
+      // Update chat history
       session.chatHistory.push({ role: 'user', content: text });
       if (session.chatHistory.length > 40) session.chatHistory.shift();
 
-      // Call GPT
+      // 3) Call OpenAI GPT
       let reply;
       try {
         const resp = await openai.chat.completions.create({
@@ -154,10 +161,10 @@ wss.on('connection', (ws, req) => {
         session.chatHistory.push({ role: 'assistant', content: reply });
       } catch (e) {
         console.error('❌ OpenAI error', e);
-        reply = "Sorry, I'm having trouble understanding.";
+        reply = "Sorry, I'm having trouble.";
       }
 
-      // ElevenLabs TTS
+      // 4) ElevenLabs TTS
       let audioBuf;
       try {
         const ttsRes = await axios.post(
@@ -177,11 +184,11 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Send outbound audio in sequence
+      // 5) Send outbound audio in sequence
       session.queue = session.queue.then(() =>
         new Promise(r => setTimeout(() => {
           ws.send(JSON.stringify({
-            event:          'media',
+            event: 'media',
             media: {
               track:   'outbound',
               payload: audioBuf.toString('base64')
@@ -193,57 +200,39 @@ wss.on('connection', (ws, req) => {
     }
   };
 
-  // Attach STT event listeners when ready
+  // Attach when DG stream is ready
   const waitForDG = () => new Promise(r => {
-    const check = () => {
-      if (session.dgStream) return r();
-      setTimeout(check, 50);
-    };
+    const check = () => session.dgStream ? r() : setTimeout(check, 50);
     check();
   });
-
   waitForDG().then(() => {
-    session.dgStream.on(
-      LiveTranscriptionEvents.Transcript, onTranscript
-    );
-    session.dgStream.on(
-      LiveTranscriptionEvents.Error, err => {
-        console.error('❌ DG stream error', err);
-        cleanup();
-      }
-    );
-    session.dgStream.on(
-      LiveTranscriptionEvents.Close, cleanup
-    );
-    session.dgStream.on(
-      LiveTranscriptionEvents.Finish, cleanup
-    );
+    session.dgStream.on(LiveTranscriptionEvents.Transcript, onTranscript);
+    session.dgStream.on(LiveTranscriptionEvents.Error,  err => { console.error('❌ DG stream error', err); cleanup(); });
+    session.dgStream.on(LiveTranscriptionEvents.Close,  cleanup);
+    session.dgStream.on(LiveTranscriptionEvents.Finish, cleanup);
   });
 
-  // 3) Receive Twilio media & forward to Deepgram
+  // 6) Forward Twilio media to Deepgram
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
     if (msg.event === 'media' && msg.media?.payload) {
       const pcm = Buffer.from(msg.media.payload, 'base64');
       session.dgStream?.send(pcm);
     }
     if (msg.event === 'stop') {
-      console.log('🛑 Twilio stopped');
+      console.log('🛑 Twilio stop');
       cleanup();
     }
   });
 
-  ws.on('close', () => { console.log('❌ WS closed'); cleanup(); });
-  ws.on('error', () => cleanup());
+  ws.on('close',  () => { console.log('❌ WS closed'); cleanup(); });
+  ws.on('error',  () => cleanup());
 });
 
 server.on('upgrade', (req, sock, head) => {
   if (req.url === '/ws') {
-    wss.handleUpgrade(req, sock, head, ws =>
-      wss.emit('connection', ws, req)
-    );
+    wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws, req));
   } else sock.destroy();
 });
 
