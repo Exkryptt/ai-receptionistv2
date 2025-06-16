@@ -10,7 +10,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 const dgClient = createClient(process.env.DEEPGRAM_API_KEY);
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 app.use(express.urlencoded({ extended: true }));
 
@@ -34,7 +37,8 @@ app.all('/twiml', (req, res) => {
   const xml = `
     <Response>
       <Start>
-        <Stream url="wss://${req.headers.host}/ws" track="inbound_track" />
+        <!-- Stream only the inbound leg -->
+        <Stream url="wss://${req.headers.host}/ws" track="inbound" />
       </Start>
       <Say>Hi, this is your GP clinic assistant. Please begin speaking after the beep.</Say>
       <Pause length="60"/>
@@ -45,44 +49,10 @@ app.all('/twiml', (req, res) => {
 });
 
 wss.on('connection', async (ws, req) => {
-  console.log('==> ///////////////////////////////////////////////////////////');
   console.log('📞 Twilio WebSocket stream connected');
 
   let dgStream;
   let streamClosed = false;
-  try {
-    dgStream = await dgClient.listen.live({
-      encoding: 'mulaw',
-      sample_rate: 8000,
-      interim_results: true,
-      language: 'en',
-      smart_format: true,
-    });
-    console.log('🔗 Deepgram live stream started (encoding: mulaw, sample_rate: 8000)');
-  } catch (err) {
-    console.error('❌ Failed to start Deepgram stream:', err);
-    ws.close();
-    return;
-  }
-
-  // Deepgram event listeners
-  dgStream.on('transcriptReceived', (data) => {
-    if (data.channel?.alternatives?.[0]?.transcript) {
-      const transcript = data.channel.alternatives[0].transcript;
-      if (data.is_final) {
-        console.log('🗣 Final transcript:', transcript);
-        // TODO: Integrate OpenAI/ElevenLabs here
-      } else {
-        console.log('... Interim:', transcript);
-      }
-    } else {
-      console.log('🔇 Deepgram: No transcript received in this chunk.');
-    }
-  });
-  dgStream.on('error', (err) => console.error('❌ Deepgram error:', err));
-  dgStream.on('close', () => console.log('🛑 Deepgram stream closed'));
-  dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
-
   function cleanupDeepgram() {
     if (!streamClosed) {
       streamClosed = true;
@@ -91,19 +61,52 @@ wss.on('connection', async (ws, req) => {
     }
   }
 
+  try {
+    dgStream = await dgClient.transcription.live({
+      content_type:    'audio/raw;encoding=mulaw;rate=8000',
+      model:           'phonecall',
+      language:        'en-US',
+      interim_results: true,
+      punctuate:       true,
+    });
+    console.log('🔗 Deepgram live stream started with phonecall model');
+  } catch (err) {
+    console.error('❌ Deepgram stream error:', err);
+    ws.close();
+    return;
+  }
+
+  dgStream.on('transcriptReceived', (data) => {
+    const alt = data.channel?.alternatives?.[0];
+    if (!alt || !alt.transcript) return;
+    if (data.is_final) {
+      console.log('🗣 Final:', alt.transcript);
+    } else {
+      console.log('… Interim:', alt.transcript);
+    }
+  });
+  dgStream.on('error', (err) => {
+    console.error('❌ Deepgram error:', err);
+    cleanupDeepgram();
+  });
+  dgStream.on('close', cleanupDeepgram);
+  dgStream.on('finish', () => console.log('🛑 Deepgram stream finished'));
+
   ws.on('message', (msg) => {
     try {
       const parsed = JSON.parse(msg);
       switch (parsed.event) {
         case 'connected':
-          console.log(`[Twilio] Unhandled event: ${msg}`);
+          console.log(`[Twilio] ${msg}`);
           break;
         case 'start':
           console.log(`🟢 [Twilio] stream started: ${msg}`);
           break;
         case 'media':
           const audio = Buffer.from(parsed.media.payload, 'base64');
-          console.log(`[media] got ${audio.length} bytes from Twilio (forwarding to Deepgram)`);
+          console.log(
+            `[media] got ${audio.length} bytes from Twilio (forwarding to Deepgram)`
+          );
           dgStream.send(audio);
           break;
         case 'stop':
@@ -122,7 +125,6 @@ wss.on('connection', async (ws, req) => {
     console.error('❌ WebSocket error:', err);
     cleanupDeepgram();
   });
-
   ws.on('close', () => {
     console.log('❌ WebSocket closed');
     cleanupDeepgram();
@@ -142,6 +144,5 @@ server.on('upgrade', (req, socket, head) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log('==> ///////////////////////////////////////////////////////////');
   console.log('==> Available at your primary URL');
 });
