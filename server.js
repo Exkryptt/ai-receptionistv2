@@ -5,13 +5,13 @@ const http      = require('http');
 const WebSocket = require('ws');
 const twilio    = require('twilio');
 const { OpenAI } = require('openai');
+const PORT = Number(process.env.PORT) || 3000;
 
 //───────────────────────────────────────────────────────────────────────────────
 // CONFIG
 //───────────────────────────────────────────────────────────────────────────────
 
 const {
-  PORT = 3000,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   YOUR_PHONE_NUMBER,
@@ -183,5 +183,5 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`✅ Listening on port ${PORT}`);
+  console.log(`✅ Server listening on port ${PORT}`);
 });
