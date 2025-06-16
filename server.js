@@ -62,7 +62,7 @@ app.post('/twiml', (req, res) => {
       <Say>Hi, this is your GP clinic assistant.</Say>
       <Pause length="1"/>
       <Connect>
-        <Stream url="wss://${req.headers.host}/ws" track="inbound"/>
+        <Stream url="wss://${req.headers.host}/ws" track="inbound_track"/>
       </Connect>
     </Response>
   `);
