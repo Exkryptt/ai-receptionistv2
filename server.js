@@ -4,7 +4,7 @@ const express   = require('express');
 const http      = require('http');
 const WebSocket = require('ws');
 const twilio    = require('twilio');
-const { Deepgram } = require('@deepgram/sdk');
+const { Deepgram, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
 ////////////////////////////////////////////////////////////////////////////////
 // CONFIG & CLIENTS
@@ -19,9 +19,16 @@ const {
   DEEPGRAM_API_KEY
 } = process.env;
 
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !YOUR_PHONE_NUMBER
- || !TWILIO_NUMBER || !DEEPGRAM_API_KEY) {
-  console.error('❌ Missing one of TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, YOUR_PHONE_NUMBER, TWILIO_NUMBER, DEEPGRAM_API_KEY');
+if (
+  !TWILIO_ACCOUNT_SID ||
+  !TWILIO_AUTH_TOKEN ||
+  !YOUR_PHONE_NUMBER ||
+  !TWILIO_NUMBER ||
+  !DEEPGRAM_API_KEY
+) {
+  console.error(
+    '❌ Missing one of TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, YOUR_PHONE_NUMBER, TWILIO_NUMBER, DEEPGRAM_API_KEY'
+  );
   process.exit(1);
 }
 
@@ -35,7 +42,7 @@ const tw = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// TwiML for inbound calls: Connect+Stream inbound_track
+// TwiML for inbound calls: connect + stream inbound_track
 app.post('/twiml', (req, res) => {
   res.type('text/xml').send(`
     <Response>
@@ -55,7 +62,7 @@ app.get('/call-me', async (req, res) => {
       url:    `https://${req.headers.host}/twiml`,
       to:     YOUR_PHONE_NUMBER,
       from:   TWILIO_NUMBER,
-      method: 'POST'
+      method: 'POST',
     });
     console.log('📞 Outbound call SID:', call.sid);
     res.send('Calling you now…');
@@ -72,58 +79,82 @@ app.get('/call-me', async (req, res) => {
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ noServer: true });
 
-// Handle Twilio media streams
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio WS connected');
 
-  // 1) Open Deepgram live‐transcription stream
-  const dgStream = await dg.transcription.live({
-    content_type:    'audio/x-mulaw;rate=8000',
-    model:           'nova-phonecall',
-    language:        'en-US',
-    interim_results: true,
-    punctuate:       true,
-    channels:        1,
-  });
-  console.log('🔗 Deepgram STT opened');
+  // 1) Open Deepgram live transcription stream
+  let closed = false;
+  const cleanup = () => {
+    if (!closed) {
+      closed = true;
+      dgStream.finish();
+      console.log('🧹 Deepgram stream finished');
+    }
+  };
+
+  let dgStream;
+  try {
+    dgStream = dg.transcription.live({
+      content_type:    'audio/x-mulaw;rate=8000',
+      model:           'nova-phonecall',
+      language:        'en-US',
+      interim_results: true,
+      punctuate:       true,
+      channels:        1,
+    });
+    console.log('🔗 Deepgram STT opened');
+  } catch (err) {
+    console.error('❌ Deepgram init error:', err);
+    ws.close();
+    return;
+  }
 
   // 2) Listen for transcripts
   dgStream.on('transcriptReceived', (evt) => {
     const alt = evt.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
-
     const tag = evt.is_final ? '🛑 FINAL:' : '… interim:';
     console.log(tag, alt.transcript);
-    // TODO: pipe alt.transcript into your AI agent / TTS here
+    // TODO: feed alt.transcript into your AI logic / TTS
   });
 
   dgStream.on('error', (err) => {
     console.error('❌ Deepgram error:', err);
-    dgStream.finish();
+    cleanup();
     ws.close();
   });
 
   dgStream.on('close', () => {
     console.log('⚡ Deepgram stream closed');
+    cleanup();
     ws.close();
   });
 
-  // 3) Receive Twilio media → forward to Deepgram
+  // 3) Receive Twilio media —> forward to Deepgram
   ws.on('message', (raw) => {
-    const msg = JSON.parse(raw);
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
     if (msg.event === 'media' && msg.media?.payload) {
       const pcm = Buffer.from(msg.media.payload, 'base64');
       dgStream.send(pcm);
     }
     if (msg.event === 'stop') {
       console.log('🛑 Twilio stop event');
-      dgStream.finish();
+      cleanup();
     }
   });
 
   ws.on('close', () => {
     console.log('❌ WS closed');
-    dgStream.finish();
+    cleanup();
+  });
+  ws.on('error', (err) => {
+    console.error('❌ WS error:', err);
+    cleanup();
   });
 });
 
