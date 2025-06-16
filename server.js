@@ -114,7 +114,6 @@ wss.on('connection', async (ws) => {
       : text;
     lastTranscript = text;
 
-    // Log each new word
     delta.split(/\s+/).filter(Boolean).forEach(w => console.log('🟢 Word:', w));
 
     if (evt.is_final) {
