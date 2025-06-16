@@ -233,6 +233,7 @@ wss.on('connection', (ws) => {
   })();
 
   // 6) Twilio -> Deepgram forwarding & raw logging
+    // 6) Twilio → Deepgram forwarding & raw logging
   ws.on('message', (raw) => {
     debugLog('🥡 RAW TWILIO MSG:', raw.toString());
     let msg;
@@ -242,15 +243,28 @@ wss.on('connection', (ws) => {
       console.error('❌ Failed to parse Twilio message');
       return;
     }
-    if (msg.event === 'media' && msg.media?.payload) {
-      const pcm = Buffer.from(msg.media.payload, 'base64');
-      session.dgStream?.send(pcm);
-    }
-    if (msg.event === 'stop') {
-      console.log('🛑 Twilio stop');
-      cleanup();
+
+    switch (msg.event) {
+      case 'start':
+        console.log('🟢 [Twilio] Stream STARTED', msg.streamSid);
+        break;
+
+      case 'media':
+        const b64 = msg.media?.payload;
+        if (b64) {
+          const pcm = Buffer.from(b64, 'base64');
+          console.log(`📨 Forwarding ${pcm.length} bytes of μ-law to Deepgram`);
+          session.dgStream?.send(pcm);
+        }
+        break;
+
+      case 'stop':
+        console.log('🛑 [Twilio] Stream STOPPED');
+        cleanup();
+        break;
     }
   });
+
 
   ws.on('close',  () => { console.log('❌ WS closed'); cleanup(); });
   ws.on('error',  err => { console.error('❌ WS error', err); cleanup(); });
