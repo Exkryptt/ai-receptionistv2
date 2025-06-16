@@ -50,7 +50,6 @@ const aiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// TwiML for inbound/outbound calls
 app.post('/twiml', (_, res) => {
   res.type('text/xml').send(`
     <Response>
@@ -63,7 +62,6 @@ app.post('/twiml', (_, res) => {
   `);
 });
 
-// Trigger outbound call
 app.get('/call-me', async (_, res) => {
   try {
     const call = await twClient.calls.create({
@@ -100,7 +98,19 @@ wss.on('connection', (twilioWs) => {
   );
 
   aaWs.on('open', () => {
-    console.log('🔗 AssemblyAI WS open – flushing buffered audio…');
+    console.log('🔗 AssemblyAI WS open – sending start config & flushing buffered audio…');
+
+    // 1) Send the required "start" config frame:
+    aaWs.send(JSON.stringify({
+      config: {
+        encoding:      'mulaw',
+        sample_rate:   8000,
+        channels:      1,
+        language_code: 'en_us'
+      }
+    }));
+
+    // 2) Now flush any audio we buffered before it was open:
     for (const chunk of pendingAudio) {
       aaWs.send(chunk);
     }
@@ -119,19 +129,16 @@ wss.on('connection', (twilioWs) => {
           model:       'gpt-4o-mini',
           messages: [
             { role: 'system', content: 'You are a friendly sandwich bar assistant. Keep replies to 20 words or less.' },
-            { role: 'user', content: partial }
+            { role: 'user',   content: partial }
           ],
           max_tokens:  30,
           temperature: 0.7,
           stream:      true
         });
 
-        let aiReply = '';
         process.stdout.write('🤖 streaming reply: ');
         completion.on('data', (chunk) => {
-          const delta = chunk.choices[0].delta?.content || '';
-          process.stdout.write(delta);
-          aiReply += delta;
+          process.stdout.write(chunk.choices[0].delta?.content || '');
         });
         completion.on('end', () => {
           console.log('\n— done streaming');
