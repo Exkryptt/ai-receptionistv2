@@ -62,7 +62,7 @@ wss.on('connection', async (ws, req) => {
   }
 
   try {
-    dgStream = await dgClient.transcription.live({
+    dgStream = await dgClient.listen.live({
       content_type:    'audio/raw;encoding=mulaw;rate=8000',
       model:           'phonecall',
       language:        'en-US',
