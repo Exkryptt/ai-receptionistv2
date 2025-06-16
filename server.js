@@ -78,20 +78,29 @@ wss.on('connection', async (ws, req) => {
     return;
   }
 
-  // Listen for connection open (optional)
-  dgStream.on(LiveTranscriptionEvents.Open, () => {
-    console.log('🔓 Deepgram socket opened');
-  });
+  // Track last interim transcript so we can diff
+  let lastTranscript = '';
 
-  // Listen for interim + final transcripts
+  // Listen for interim + final transcripts, word-by-word
   dgStream.on(LiveTranscriptionEvents.Transcript, (data) => {
     const alt = data.channel?.alternatives?.[0];
     if (!alt || !alt.transcript) return;
 
+    const transcript = alt.transcript;
+    // Compute newly added text
+    const newText = transcript.startsWith(lastTranscript)
+      ? transcript.slice(lastTranscript.length)
+      : transcript;
+    lastTranscript = transcript;
+
+    // Split into words and log each immediately
+    newText.trim().split(/\s+/).filter(Boolean).forEach(word => {
+      console.log('🟢 Word:', word);
+    });
+
     if (data.is_final) {
-      console.log('🗣 Final:', alt.transcript);
-    } else {
-      console.log('… Interim:', alt.transcript);
+      console.log('🛑 Final utterance complete');
+      lastTranscript = '';
     }
   });
 
@@ -143,7 +152,7 @@ wss.on('connection', async (ws, req) => {
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
-    wss.handleUpgrade(req, socket, head, (ws) =>
+    wss.handleUpgrade(req, socket, head, ws =>
       wss.emit('connection', ws, req)
     );
   } else {
