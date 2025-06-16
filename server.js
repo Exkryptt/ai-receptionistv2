@@ -5,13 +5,13 @@ const http      = require('http');
 const WebSocket = require('ws');
 const twilio    = require('twilio');
 const { OpenAI } = require('openai');
-const PORT = Number(process.env.PORT) || 3000;
 
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 // CONFIG
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 
 const {
+  PORT: PORT_ENV,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   YOUR_PHONE_NUMBER,
@@ -20,32 +20,37 @@ const {
   OPENAI_API_KEY
 } = process.env;
 
-if (!TWILIO_ACCOUNT_SID ||
-    !TWILIO_AUTH_TOKEN   ||
-    !YOUR_PHONE_NUMBER   ||
-    !TWILIO_NUMBER       ||
-    !ASSEMBLYAI_API_KEY  ||
-    !OPENAI_API_KEY
+const PORT = Number(PORT_ENV) || 3000;
+
+if (
+  !TWILIO_ACCOUNT_SID ||
+  !TWILIO_AUTH_TOKEN   ||
+  !YOUR_PHONE_NUMBER   ||
+  !TWILIO_NUMBER       ||
+  !ASSEMBLYAI_API_KEY  ||
+  !OPENAI_API_KEY
 ) {
-  console.error('❌ Missing one of required env vars: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, YOUR_PHONE_NUMBER, TWILIO_NUMBER, ASSEMBLYAI_API_KEY, OPENAI_API_KEY');
+  console.error(
+    '❌ Missing one of required env vars: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, YOUR_PHONE_NUMBER, TWILIO_NUMBER, ASSEMBLYAI_API_KEY, OPENAI_API_KEY'
+  );
   process.exit(1);
 }
 
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 // CLIENTS
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 
 const twClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const aiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 // EXPRESS + TWILIO ROUTES
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// TwiML endpoint for both inbound & outbound calls
+// TwiML for inbound/outbound calls
 app.post('/twiml', (_, res) => {
   res.type('text/xml').send(`
     <Response>
@@ -58,7 +63,7 @@ app.post('/twiml', (_, res) => {
   `);
 });
 
-// Trigger an outbound call to YOUR_PHONE_NUMBER
+// Trigger outbound call
 app.get('/call-me', async (_, res) => {
   try {
     const call = await twClient.calls.create({
@@ -75,9 +80,9 @@ app.get('/call-me', async (_, res) => {
   }
 });
 
-//───────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET SERVER
-//───────────────────────────────────────────────────────────────────────────────
+////////////////////////////////////////////////////////////////////////////////
+// WEBSOCKET SERVER + STREAMING LOGIC
+////////////////////////////////////////////////////////////////////////////////
 
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ noServer: true });
@@ -85,17 +90,21 @@ const wss    = new WebSocket.Server({ noServer: true });
 wss.on('connection', (twilioWs) => {
   console.log('📞 Twilio WS connected');
 
-  // 1) Open AssemblyAI WebSocket
-  const aaWs = new WebSocket('wss://api.assemblyai.com/v2/realtime/ws?sample_rate=8000', {
-    headers: { Authorization: ASSEMBLYAI_API_KEY }
-  });
+  // Buffer until AA WS is open
+  const pendingAudio = [];
 
-  let convo = [
-    { role: 'system', content: 'You are a friendly sandwich bar assistant. Keep replies to 20 words or less.' }
-  ];
+  // Open AssemblyAI realtime WebSocket
+  const aaWs = new WebSocket(
+    'wss://api.assemblyai.com/v2/realtime/ws?sample_rate=8000',
+    { headers: { Authorization: ASSEMBLYAI_API_KEY } }
+  );
 
   aaWs.on('open', () => {
-    console.log('🔗 AssemblyAI WS open');
+    console.log('🔗 AssemblyAI WS open – flushing buffered audio…');
+    for (const chunk of pendingAudio) {
+      aaWs.send(chunk);
+    }
+    pendingAudio.length = 0;
   });
 
   aaWs.on('message', async (data) => {
@@ -104,14 +113,14 @@ wss.on('connection', (twilioWs) => {
       const partial = msg.text.trim();
       console.log('… interim transcript:', partial);
 
-      // 2) Immediately fire off an OpenAI stream for this partial:
-      const userMsg = { role: 'user', content: partial };
-      const messages = convo.concat(userMsg);
-
+      // Send partial to OpenAI with streaming
       try {
         const completion = await aiClient.chat.completions.create({
           model:       'gpt-4o-mini',
-          messages,
+          messages: [
+            { role: 'system', content: 'You are a friendly sandwich bar assistant. Keep replies to 20 words or less.' },
+            { role: 'user', content: partial }
+          ],
           max_tokens:  30,
           temperature: 0.7,
           stream:      true
@@ -126,26 +135,20 @@ wss.on('connection', (twilioWs) => {
         });
         completion.on('end', () => {
           console.log('\n— done streaming');
-          // Note: not updating convo yet on partials; wait for final transcript
         });
       } catch (err) {
         console.error('❌ OpenAI error on partial:', err);
       }
 
     } else if (msg.message_type === 'FinalTranscript') {
-      const final = msg.text.trim();
-      console.log('🛑 final transcript:', final);
-
-      // 3) Update convo and optionally fire off a non‐streaming full reply
-      convo.push({ role: 'user', content: final });
-      // …you could do a final OpenAI turn here if desired…
+      console.log('🛑 final transcript:', msg.text.trim());
     }
   });
 
   aaWs.on('close', () => console.log('⚡ AssemblyAI WS closed'));
   aaWs.on('error',  (e) => console.error('❌ AssemblyAI WS error:', e));
 
-  // 4) Pipe Twilio audio into AssemblyAI
+  // Forward Twilio media -> AssemblyAI
   twilioWs.on('message', (raw) => {
     let msg;
     try {
@@ -154,8 +157,12 @@ wss.on('connection', (twilioWs) => {
       return;
     }
     if (msg.event === 'media' && msg.media?.payload) {
-      // Twilio gives you µ-law 8kHz base64
-      aaWs.send(JSON.stringify({ audio_data: msg.media.payload }));
+      const payload = JSON.stringify({ audio_data: msg.media.payload });
+      if (aaWs.readyState === WebSocket.OPEN) {
+        aaWs.send(payload);
+      } else {
+        pendingAudio.push(payload);
+      }
     }
     if (msg.event === 'stop') {
       console.log('🛑 Twilio end');
