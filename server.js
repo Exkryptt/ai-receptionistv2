@@ -82,16 +82,17 @@ const wss    = new WebSocket.Server({ noServer: true });
 wss.on('connection', async (ws) => {
   console.log('📞 Twilio WS connected');
 
-  // 1) Open Deepgram live transcription stream
+  // Safety cleanup
   let closed = false;
   const cleanup = () => {
     if (!closed) {
       closed = true;
-      dgStream.finish();
+      try { dgStream.finish(); } catch {}
       console.log('🧹 Deepgram stream finished');
     }
   };
 
+  // 1) Open Deepgram live transcription stream
   let dgStream;
   try {
     dgStream = dg.transcription.live({
@@ -130,7 +131,7 @@ wss.on('connection', async (ws) => {
     ws.close();
   });
 
-  // 3) Receive Twilio media —> forward to Deepgram
+  // 3) Receive Twilio media → forward to Deepgram
   ws.on('message', (raw) => {
     let msg;
     try {
