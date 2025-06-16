@@ -4,8 +4,7 @@ const express   = require('express');
 const http      = require('http');
 const WebSocket = require('ws');
 const twilio    = require('twilio');
-const { Realtime } = require('@assemblyai/realtime-client');
-const { OpenAI }   = require('openai');
+const { OpenAI } = require('openai');
 
 ////////////////////////////////////////////////////////////////////////////////
 // CONFIG & CLIENTS
@@ -30,7 +29,13 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN ||
 }
 
 const twClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const aiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+const openai   = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// System prompt for later AI responses
+const SYSTEM_PROMPT = `
+You work at a London sandwich bar taking orders. Upsell the muscle & pickled sandwich (£4).
+Drinks £1, cakes £2. Ask for name & pickup time first. Responses ≤20 words.
+`.trim();
 
 ////////////////////////////////////////////////////////////////////////////////
 // EXPRESS + TWILIO ROUTES
@@ -39,138 +44,41 @@ const aiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// TwiML for inbound streaming
+// TwiML to start streaming on call
 app.post('/twiml', (_, res) => {
-  const host = _.headers.host;
   res.type('xml').send(`
 <Response>
-  <Say>Hi, thank you for calling our sandwich bar.</Say>
-  <Pause length="1"/>
+  <Say voice="Polly.Joanna">Hi, this is your sandwich bar. Please speak after the beep.</Say>
   <Connect>
-    <Stream url="wss://${host}/ws" track="inbound_track"/>
+    <Stream url="wss://${_.headers.host}/ws"/>
   </Connect>
-</Response>`.trim());
+  <Pause length="60"/>
+</Response>` .trim());
 });
 
-// Trigger outbound call
-app.get('/call-me', async (_, res) => {
+// Trigger an outbound call
+app.get('/call-me', async (req, res) => {
   try {
     const call = await twClient.calls.create({
-      url:    `https://${_.headers.host}/twiml`,
+      url:    `https://${req.headers.host}/twiml`,
       to:     YOUR_PHONE_NUMBER,
       from:   TWILIO_NUMBER,
       method: 'POST'
     });
     console.log('📞 Outbound call SID:', call.sid);
-    res.send('Calling you now…');
+    res.send('Calling your phone now…');
   } catch (err) {
-    console.error('❌ Twilio error:', err);
+    console.error('❌ Twilio call error:', err);
     res.status(500).send('Call failed');
   }
 });
 
 ////////////////////////////////////////////////////////////////////////////////
-// WEBSOCKET SERVER & STREAMING
+// WEBSOCKET UPGRADE
 ////////////////////////////////////////////////////////////////////////////////
 
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ noServer: true });
-
-wss.on('connection', (twilioWs) => {
-  console.log('📞 Twilio WS connected');
-
-  // Create AssemblyAI realtime client
-  const realtime = new Realtime({
-    auth: ASSEMBLYAI_API_KEY,
-    encoding: 'mulaw',      // μ-law
-    sampleRate: 8000,
-    format: 'turns',        // enable end-of-turn detection
-    interimResults: true,   // stream partial transcripts
-    languageCode: 'en_us'
-  });
-
-  // Forward partials & finals to console and OpenAI
-  realtime.on('partialTranscript', async (part) => {
-    console.log('… interim:', part.text);
-    try {
-      const stream = await aiClient.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Friendly sandwich bar assistant, ≤20 words.' },
-          { role: 'user',   content: part.text }
-        ],
-        stream: true,
-        max_tokens: 30,
-        temperature: 0.7
-      });
-      process.stdout.write('🤖 ');
-      stream.on('data', (delta) => process.stdout.write(delta.choices[0].delta?.content||''));
-      stream.on('end', () => console.log());
-    } catch (e) {
-      console.error('❌ OpenAI error:', e);
-    }
-  });
-
-  realtime.on('finalTranscript', (fin) => {
-    console.log('🛑 final:', fin.text);
-  });
-
-  realtime.on('error', (err) => {
-    console.error('❌ AssemblyAI error:', err);
-    twilioWs.close();
-  });
-
-  realtime.on('close', () => {
-    console.log('⚡ AssemblyAI closed');
-  });
-
-  // Start the realtime connection
-  realtime.start().then(() => {
-    console.log('🔗 AssemblyAI realtime started');
-  });
-
-  // Buffer until start() resolves
-  let buffer = [];
-
-  // Twilio → AssemblyAI
-  twilioWs.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    if (msg.event === 'media' && msg.media?.payload) {
-      const frame = Buffer.from(msg.media.payload, 'base64');
-      if (realtime.ready) {
-        realtime.sendAudio(frame);
-      } else {
-        buffer.push(frame);
-      }
-    }
-
-    if (msg.event === 'start') {
-      // flush buffer once ready
-      realtime.once('open', () => {
-        buffer.forEach(f => realtime.sendAudio(f));
-        buffer = [];
-      });
-    }
-
-    if (msg.event === 'stop') {
-      console.log('🛑 Twilio end');
-      realtime.stop();
-      twilioWs.close();
-    }
-  });
-
-  twilioWs.on('close', () => {
-    console.log('❌ Twilio WS closed');
-    realtime.stop();
-  });
-  twilioWs.on('error', (e) => {
-    console.error('❌ Twilio WS error:', e);
-    realtime.stop();
-  });
-});
-
 server.on('upgrade', (req, sock, head) => {
   if (req.url === '/ws') {
     wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws, req));
@@ -179,6 +87,111 @@ server.on('upgrade', (req, sock, head) => {
   }
 });
 
+////////////////////////////////////////////////////////////////////////////////
+// MAIN MEDIA-STREAM → ASSEMBLYAI → OPENAI LOGIC
+////////////////////////////////////////////////////////////////////////////////
+
+wss.on('connection', (twilioWs) => {
+  console.log('📞 Twilio media stream connected');
+
+  // Open AssemblyAI WS
+  const aaWs = new WebSocket(
+    'wss://api.assemblyai.com/v2/realtime/ws?sample_rate=8000',
+    { headers: { Authorization: ASSEMBLYAI_API_KEY } }
+  );
+
+  // Buffer incoming audio until AA socket is ready
+  let buffer = [];
+  let aaReady = false;
+
+  // Send config immediately on AA open
+  aaWs.on('open', () => {
+    console.log('🔗 AssemblyAI WS open – sending config');
+    aaWs.send(JSON.stringify({
+      config: {
+        encoding:        'mulaw',
+        sample_rate:     8000,
+        channels:        1,
+        language_code:   'en_us',
+        interim_results: true
+      }
+    }));
+    aaReady = true;
+    // flush any buffered audio
+    buffer.forEach(f => aaWs.send(f));
+    buffer = [];
+  });
+
+  // Throttle interim logs to once per second
+  let lastLog = 0;
+
+  // Handle messages from AssemblyAI
+  aaWs.on('message', async (raw) => {
+    const msg = JSON.parse(raw);
+    if (msg.message_type === 'PartialTranscript') {
+      const text = msg.text.trim();
+      const now  = Date.now();
+      if (now - lastLog > 1000) {
+        console.clear();
+        console.log('… interim:', text);
+        lastLog = now;
+      }
+    }
+    else if (msg.message_type === 'FinalTranscript') {
+      console.clear();
+      console.log('🛑 final:', msg.text.trim());
+      lastLog = Date.now();
+
+      // Example: send final transcript to OpenAI
+      try {
+        const resp = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user',   content: msg.text.trim() }
+          ],
+          max_tokens:  50,
+          temperature: 0.7,
+        });
+        console.log('🤖 AI says:', resp.choices[0].message.content.trim());
+      } catch (e) {
+        console.error('❌ OpenAI error:', e);
+      }
+    }
+  });
+
+  aaWs.on('error',   e => console.error('❌ AssemblyAI error:', e));
+  aaWs.on('close',   () => console.log('⚡ AssemblyAI WS closed'));
+
+  // Forward Twilio audio to AssemblyAI
+  twilioWs.on('message', raw => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.event === 'media' && msg.media?.payload) {
+      const frame = JSON.stringify({ audio_data: msg.media.payload });
+      if (aaReady) aaWs.send(frame);
+      else         buffer.push(frame);
+    }
+
+    if (msg.event === 'stop') {
+      console.log('🛑 Twilio stream stopped');
+      aaWs.close();
+      twilioWs.close();
+    }
+  });
+
+  twilioWs.on('close', () => {
+    console.log('❌ Twilio WS closed');
+    aaWs.close();
+  });
+  twilioWs.on('error', (e) => {
+    console.error('❌ Twilio WS error:', e);
+    aaWs.close();
+  });
+});
+
 server.listen(PORT, () => {
-  console.log(`✅ Listening on port ${PORT}`);
+  console.log(`✅ Server listening on port ${PORT}`);
+  console.log(`👉 GET https://<your-domain>/call-me to test`);
 });
