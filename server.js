@@ -1,18 +1,18 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
+const http    = require('http');
 const WebSocket = require('ws');
-const { Configuration, OpenAIApi } = require('openai');
+const twilio  = require('twilio');
+const { OpenAI } = require('openai');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
 const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ noServer: true });
 
-// Deepgram & OpenAI clients
+// Initialize clients
 const dgClient = createClient(process.env.DEEPGRAM_API_KEY);
-const oaConfig = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
-const openai   = new OpenAIApi(oaConfig);
+const openai   = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // In-memory chat history
 const chatHistory = [];
@@ -27,20 +27,22 @@ Keep responses ≤ 20 words.
 Always ask for caller’s name and pickup time first.
 `.trim();
 
-// TwiML endpoint for Twilio
+// TwiML endpoint for incoming calls
 app.post('/twiml', (req, res) => {
   res.type('xml').send(`
     <Response>
       <Say>Hi, this is your GP clinic assistant.</Say>
       <Pause length="1"/>
-      <Start><Stream url="wss://${req.headers.host}/ws"/></Start>
+      <Start><Stream url="wss://${req.headers.host}/ws" track="inbound"/></Start>
       <Pause length="30"/>
     </Response>
   `);
 });
+
+// Outbound dialing endpoint
 app.get('/call-me', async (req, res) => {
   try {
-    const client = require('twilio')(
+    const client = twilio(
       process.env.TWILIO_ACCOUNT_SID,
       process.env.TWILIO_AUTH_TOKEN
     );
@@ -62,27 +64,30 @@ app.get('/call-me', async (req, res) => {
 server.listen(process.env.PORT||3000, () => {
   console.log(`✅ Listening on port ${server.address().port}`);
 });
-server.on('upgrade', (req, sock, head) => {
+server.on('upgrade', (req, socket, head) => {
   if (req.url === '/ws') {
-    wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws, req));
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   } else {
-    sock.destroy();
+    socket.destroy();
   }
 });
 
 wss.on('connection', async (ws) => {
-  console.log('📞 Twilio WS connected');
+  console.log('📞 Twilio WebSocket connected');
 
   let dgStream;
   let lastTranscript = '';
   let outboundSeq = Promise.resolve();
 
+  // Cleanup helper
   const cleanup = () => {
-    if (dgStream) dgStream.finish();
-    console.log('🧹 Cleaned up');
+    if (dgStream) {
+      try { dgStream.finish(); } catch {}
+      console.log('🧹 Cleaned up Deepgram');
+    }
   };
 
-  // 1) open Deepgram listen.live
+  // 1) Open Deepgram live transcription
   try {
     dgStream = await dgClient.listen.live({
       content_type:    'audio/raw;encoding=mulaw;rate=8000',
@@ -91,14 +96,14 @@ wss.on('connection', async (ws) => {
       interim_results: true,
       punctuate:       true,
     });
-    console.log('🔗 DG live opened');
+    console.log('🔗 Deepgram live stream started');
   } catch (e) {
-    console.error('❌ DG error', e);
+    console.error('❌ Deepgram error:', e);
     ws.close();
     return;
   }
 
-  // 2) handle STT events
+  // 2) Handle transcription events
   dgStream.on(LiveTranscriptionEvents.Transcript, async (evt) => {
     const alt = evt.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
@@ -109,13 +114,14 @@ wss.on('connection', async (ws) => {
       : text;
     lastTranscript = text;
 
+    // Log each new word
     delta.split(/\s+/).filter(Boolean).forEach(w => console.log('🟢 Word:', w));
 
     if (evt.is_final) {
-      console.log('🛑 Final:', text);
+      console.log('🛑 Final transcript:', text);
       lastTranscript = '';
 
-      // build messages
+      // Build chat messages
       const messages = [
         { role: 'system', content: SYSTEM_PROMPT },
         ...chatHistory,
@@ -124,16 +130,16 @@ wss.on('connection', async (ws) => {
 
       try {
         // 3) OpenAI Chat
-        const resp = await openai.createChatCompletion({
-          model: 'gpt-4o-mini',
+        const resp = await openai.chat.completions.create({
+          model:       'gpt-4o-mini',
           messages,
-          max_tokens: 200,
+          max_tokens:  200,
           temperature: 1,
         });
-        const reply = resp.data.choices[0].message.content.trim();
+        const reply = resp.choices[0].message.content.trim();
         console.log('🤖 GPT-4o reply:', reply);
 
-        // update history
+        // Update history
         chatHistory.push({ role: 'user',      content: text  });
         chatHistory.push({ role: 'assistant', content: reply });
         if (chatHistory.length > 40) chatHistory.splice(0, chatHistory.length-40);
@@ -145,14 +151,14 @@ wss.on('connection', async (ws) => {
         );
         const reader = (await ttsRes.getStream()).getReader();
         const chunks = [];
-        while(true) {
+        while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           chunks.push(value);
         }
         const audioBuf = Buffer.concat(chunks);
 
-        // 5) send back as outbound media
+        // 5) Send outbound audio
         outboundSeq = outboundSeq.then(() => new Promise(res => {
           setTimeout(() => {
             ws.send(JSON.stringify({
@@ -166,43 +172,42 @@ wss.on('connection', async (ws) => {
             res();
           }, 100);
         }));
+
       } catch (err) {
-        console.error('❌ AI/TTS error', err);
+        console.error('❌ AI/TTS error:', err);
       }
     }
   });
 
   dgStream.on(LiveTranscriptionEvents.Error, err => {
-    console.error('❌ DG stream error', err);
+    console.error('❌ Deepgram stream error:', err);
     cleanup();
   });
   dgStream.on(LiveTranscriptionEvents.Close, cleanup);
   dgStream.on(LiveTranscriptionEvents.Finish, () => {
-    console.log('🛑 DG stream finished');
+    console.log('🛑 Deepgram stream finished');
     cleanup();
   });
 
-  // 6) Twilio media → DG
+  // 6) Forward Twilio media to Deepgram
   ws.on('message', raw => {
     const msg = JSON.parse(raw);
-    switch (msg.event) {
-      case 'media':
-        const pcm = Buffer.from(msg.media.payload, 'base64');
-        dgStream.send(pcm);
-        break;
-      case 'stop':
-        console.log('🛑 Twilio stop');
-        cleanup();
-        break;
+    if (msg.event === 'media' && msg.media?.payload) {
+      const pcm = Buffer.from(msg.media.payload, 'base64');
+      dgStream.send(pcm);
+    }
+    if (msg.event === 'stop') {
+      console.log('🛑 Twilio stream stopped');
+      cleanup();
     }
   });
 
   ws.on('close', () => {
-    console.log('❌ WS closed');
+    console.log('❌ WebSocket closed');
     cleanup();
   });
   ws.on('error', err => {
-    console.error('❌ WS error', err);
+    console.error('❌ WebSocket error:', err);
     cleanup();
   });
 });
