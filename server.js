@@ -1,148 +1,146 @@
 // server.js
-require('dotenv').config();
-const express   = require('express');
-const http      = require('http');
-const WebSocket = require('ws');
-const twilio    = require('twilio');
+import express from 'express';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import { RealtimeService } from 'assemblyai';
+import twilio from 'twilio';
+import 'dotenv/config';
 
 ////////////////////////////////////////////////////////////////////////////////
-// CONFIG
+// CONFIG & CLIENTS
 ////////////////////////////////////////////////////////////////////////////////
+// Coerce the PORT into a number; Render will supply process.env.PORT
+const PORT = Number(process.env.PORT) || 3000;
+
 const {
-  PORT = 3000,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
+  YOUR_PHONE_NUMBER,
+  ASSEMBLYAI_API_KEY
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID ||
-    !TWILIO_AUTH_TOKEN ||
-    !TWILIO_NUMBER) {
-  console.error("❌ Missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN or TWILIO_NUMBER");
+    !TWILIO_AUTH_TOKEN   ||
+    !TWILIO_NUMBER       ||
+    !YOUR_PHONE_NUMBER   ||
+    !ASSEMBLYAI_API_KEY) {
+  console.error('❌ Missing one of TWILIO_* or ASSEMBLYAI_API_KEY in env');
   process.exit(1);
 }
 
 const twClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 ////////////////////////////////////////////////////////////////////////////////
-// EXPRESS SETUP
+// EXPRESS & TWILIO WEBHOOKS
 ////////////////////////////////////////////////////////////////////////////////
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// 1) TwiML endpoint
+// 1) TwiML endpoint: answer calls & start media stream
 app.post('/voice', (req, res) => {
+  console.log('🔔 /voice webhook hit');
   const host = req.headers.host;
   const twiml = new twilio.twiml.VoiceResponse();
-  // Say greeting, then open media stream to /stream
-  twiml.say('Hello! Please speak after the beep.', { voice: 'alice' });
+  twiml.say('Please speak after the beep.', { voice: 'alice' });
   twiml.connect().stream({ url: `wss://${host}/stream` });
+  twiml.pause({ length: 60 });
   res.type('text/xml').send(twiml.toString());
+  console.log('📜 TwiML sent:', twiml.toString());
 });
 
-// 2) (Optional) outbound test
+// 2) Outbound call tester
 app.get('/call-me', async (req, res) => {
-  const to = req.query.to;
-  if (!to) return res.status(400).send("Please ?to=yourNumber");
+  console.log('🔔 /call-me hit');
   try {
     const call = await twClient.calls.create({
-      to,
+      to:   YOUR_PHONE_NUMBER,
       from: TWILIO_NUMBER,
-      url:  `https://${req.headers.host}/voice`
+      url:  `https://${req.headers.host}/voice`,
+      method: 'POST'
     });
-    res.send(`Calling ${to}: SID ${call.sid}`);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send("Call failed");
+    console.log('📞 Call SID:', call.sid);
+    res.send(`Calling ${YOUR_PHONE_NUMBER}…`);
+  } catch (err) {
+    console.error('❌ Twilio call error:', err);
+    res.status(500).send('Call failed');
   }
 });
 
 ////////////////////////////////////////////////////////////////////////////////
-// HTTP & WS SERVER
+// HTTP + WebSocket SERVER
 ////////////////////////////////////////////////////////////////////////////////
-const server = http.createServer(app);
-const wss    = new WebSocket.Server({ noServer: true });
+const server = createServer(app);
+const wss    = new WebSocketServer({ noServer: true });
 
-// Upgrade `/stream` to WebSocket
+// Upgrade HTTP to WebSocket on /stream
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/stream') {
+    console.log('🔀 Upgrading to WS on /stream');
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   } else {
     socket.destroy();
   }
 });
 
-// 3) Handle Twilio media stream frames
+////////////////////////////////////////////////////////////////////////////////
+// MEDIA STREAM → ASSEMBLYAI REALTIME
+////////////////////////////////////////////////////////////////////////////////
 wss.on('connection', (twilioWs) => {
-  console.log('🔗 Twilio Media Stream connected');
+  console.log('📡 Twilio Media Stream connected');
 
-  // AssemblyAI socket
-  const aaWs = new WebSocket(
-    'wss://streaming.assemblyai.com/v3/ws?sample_rate=8000&format_turns=true',
-    { headers: { Authorization: process.env.ASSEMBLYAI_API_KEY } }
-  );
+  // 1) Initialize AssemblyAI RealtimeService
+  const transcriber = new RealtimeService({
+    apiKey: ASSEMBLYAI_API_KEY,
+    encoding: 'pcm_mulaw',
+    sampleRate: 8000
+  });
+  const ready = transcriber.connect();
 
-  let aaReady = false;
-  const buffer = [];
-
-  // When AA socket opens, send Start and mark ready
-  aaWs.on('open', () => {
-    console.log('→ AA WS open, sending Start');
-    aaWs.send(JSON.stringify({
-      type: "Start",
-      data: {
-        access_token: process.env.ASSEMBLYAI_API_KEY,
-        sample_rate: 8000,
-        format_turns: true
-      }
-    }));
-    aaReady = true;
-    // flush any buffered frames
-    buffer.forEach(b => aaWs.send(b));
-    buffer.length = 0;
+  // 2) Handle partial transcripts
+  transcriber.on('transcript.partial', (p) => {
+    if (p.text) process.stdout.write('\r' + p.text);
   });
 
-  // Handle AA messages: interim & final
-  aaWs.on('message', msg => {
-    const data = JSON.parse(msg);
-    if (data.type === 'Turn') {
-      console.log('… interim:', data.text.trim());
-    } else if (data.type === 'Termination') {
-      console.log('🛑 final:', data.text.trim());
-      // close both sockets
-      aaWs.close();
-      twilioWs.close();
-    }
+  // 3) Handle final transcript
+  transcriber.on('transcript.final', (f) => {
+    console.log('\n🛑 Final:', f.text);
+    transcriber.close();
+    twilioWs.close();
   });
 
-  aaWs.on('error', e => console.error('AA WS error:', e));
-  aaWs.on('close', () => console.log('⚡ AA WS closed'));
+  transcriber.on('open', () => console.log('🔗 AssemblyAI connected'));
+  transcriber.on('error', (e) => console.error('❌ AA error:', e));
+  transcriber.on('close', () => console.log('⚡ AssemblyAI disconnected'));
 
-  // Forward Twilio frames into AA
-  twilioWs.on('message', raw => {
-    const frame = JSON.parse(raw);
-    if (frame.event === 'start') {
-      console.log('📤 Received start event');
-    }
-    if (frame.event === 'media' && frame.media?.payload) {
-      const audio = Buffer.from(frame.media.payload, 'base64');
-      if (aaReady) {
-        aaWs.send(audio);
-      } else {
-        buffer.push(audio);
-      }
-    }
-    if (frame.event === 'stop') {
-      console.log('🛑 Twilio stream stopped – sending AA Stop');
-      aaWs.send(JSON.stringify({ type: "Stop" }));
+  // 4) Forward Twilio audio frames
+  twilioWs.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    switch (msg.event) {
+      case 'start':
+        console.log('▶️ Twilio stream start');
+        break;
+      case 'media':
+        await ready;
+        transcriber.sendAudio(Buffer.from(msg.media.payload, 'base64'));
+        break;
+      case 'stop':
+        console.log('🛑 Twilio stream stop');
+        transcriber.stop();
+        break;
     }
   });
 
   twilioWs.on('close', () => console.log('❌ Twilio WS closed'));
+  twilioWs.on('error', (e) => console.error('❌ Twilio WS error:', e));
 });
 
-// Start it all
+////////////////////////////////////////////////////////////////////////////////
+// START SERVER
+////////////////////////////////////////////////////////////////////////////////
 server.listen(PORT, () => {
-  console.log(`🚀 Listening on https://localhost:${PORT}`);
-  console.log(`👉 POST a call to /voice or try /call-me?to=<yourNumber>`);
+  console.log(`🚀 Listening on port ${PORT}`);
+  console.log(`👉 POST /voice for inbound calls, GET  /call-me to test`);
 });
