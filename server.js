@@ -104,7 +104,7 @@ wss.on('connection', (twilioWs, req) => {
   let aaReady = false;
 
   aaWs.on('open', () => {
-    console.log('🔗 AssemblyAI WS open – sending Start');
+    console.log('🔗 AssemblyAI WS open – sending Start & marking READY');
     aaWs.send(JSON.stringify({
       type: "Start",
       data: {
@@ -113,6 +113,10 @@ wss.on('connection', (twilioWs, req) => {
         format_turns: true
       }
     }));
+    aaReady = true;
+    console.log(`⏳ Flushing ${buffer.length} buffered frames`);
+    buffer.forEach(frame => aaWs.send(frame));
+    buffer = [];
   });
 
   aaWs.on('message', async (data) => {
@@ -124,19 +128,11 @@ wss.on('connection', (twilioWs, req) => {
       return;
     }
 
-    if (msg.type === 'Ready') {
-      console.log('✅ AssemblyAI Ready — streaming audio now');
-      aaReady = true;
-      // flush buffer
-      buffer.forEach(frame => aaWs.send(frame));
-      buffer = [];
-    }
-    else if (msg.type === 'Turn') {
+    if (msg.type === 'Turn') {
       console.log('… interim:', msg.text.trim());
     }
     else if (msg.type === 'Termination') {
       console.log('🛑 final:', msg.text.trim());
-      // send AI prompt
       try {
         const resp = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
@@ -151,7 +147,6 @@ wss.on('connection', (twilioWs, req) => {
       } catch (e) {
         console.error('❌ OpenAI error:', e);
       }
-      // close both streams
       aaWs.close();
       twilioWs.close();
     }
