@@ -108,13 +108,12 @@ wss.on('connection', (twilioWs) => {
   transcriber.on('close', () => console.log('⚡ AssemblyAI WS closed'));
 
   // **Nicely formatted interim transcripts**
+ // After
   transcriber.on('transcript.partial', p => {
-    if (!p.text) return;
-    process.stdout.clearLine(0);    // clear entire current line
-    process.stdout.cursorTo(0);     // move cursor to start
-    process.stdout.write(`🌱 Interim: ${p.text}`); 
+    if (p.text) {
+      console.log(`🌱 Interim: ${p.text}`);
+    }
   });
-
   transcriber.on('transcript.final', async f => {
     console.log();  // newline
     const userText = f.text.trim();
