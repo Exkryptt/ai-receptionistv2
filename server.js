@@ -8,7 +8,7 @@ import { OpenAI } from 'openai';
 import 'dotenv/config';
 
 ////////////////////////////////////////////////////////////////////////////////
-// CONFIG & CLIENTS
+// CONFIG
 ////////////////////////////////////////////////////////////////////////////////
 const PORT = Number(process.env.PORT) || 3000;
 const {
@@ -78,10 +78,11 @@ const wss    = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith('/stream')) {
-    const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
-    const callSid   = parsedUrl.searchParams.get('callSid');
+    const parsed = new URL(req.url, `http://${req.headers.host}`);
+    const callSid = parsed.searchParams.get('callSid');
     wss.handleUpgrade(req, socket, head, (ws) => {
-      ws.callSid = callSid;
+      ws.callSid = callSid;         // attach callSid
+      ws.host    = req.headers.host; // attach host
       wss.emit('connection', ws, req);
     });
   } else {
@@ -94,6 +95,7 @@ server.on('upgrade', (req, socket, head) => {
 ////////////////////////////////////////////////////////////////////////////////
 wss.on('connection', (twilioWs) => {
   const callSid = twilioWs.callSid;
+  const host    = twilioWs.host;
   console.log('📡 Media Stream connected for CallSid =', callSid);
 
   const transcriber = new RealtimeService({
@@ -103,44 +105,39 @@ wss.on('connection', (twilioWs) => {
   });
   const ready = transcriber.connect();
 
-  transcriber.on('open', () => console.log('🔗 AssemblyAI WS connected'));
+  transcriber.on('open',  () => console.log('🔗 AssemblyAI WS connected'));
   transcriber.on('error', e => console.error('❌ AssemblyAI error:', e));
   transcriber.on('close', () => console.log('⚡ AssemblyAI WS closed'));
 
-  // **Nicely formatted interim transcripts**
- // After
+  // Simplified interim logs
   transcriber.on('transcript.partial', p => {
-    if (p.text) {
-      console.log(`🌱 Interim: ${p.text}`);
-    }
+    if (p.text) console.log(`🌱 Interim: ${p.text}`);
   });
-  transcriber.on('transcript.final', async f => {
-    console.log();  // newline
-    const userText = f.text.trim();
-    console.log('🛑 Final transcript:', userText);
 
-    // OpenAI
+  transcriber.on('transcript.final', async f => {
+    console.log('\n🛑 Final transcript:', f.text.trim());
+
+    // 1) Query OpenAI
     let aiText = 'Sorry, something went wrong.';
     try {
       const resp = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role:'system', content:'You are a helpful assistant.' },
-          { role:'user',   content:userText }
+          { role: 'system', content: 'You are SolarLink, an AI sales closer specializing in residential solar-panel installations. Your job is to guide callers from initial inquiry through booking an appointment. You greet customers warmly, ask precise questions to qualify their site (location, roof angle, shading, budget), address any concerns, recommend the optimal panel layout, and then seamlessly transition to scheduling a site survey or installation date. Keep responses concise (under 25 words), professional, and always drive toward booking the appointment. Use friendly but confident language.' },
+          { role: 'user',   content: f.text.trim() }
         ]
       });
       aiText = resp.choices[0].message.content.trim();
       console.log('🤖 AI reply:', aiText);
-    } catch (e) {
-      console.error('❌ OpenAI error:', e);
+    } catch (err) {
+      console.error('❌ OpenAI error:', err);
     }
 
-    // Redirect the live call to speak AI and resume
-    const host = twilioWs.upgradeReq.headers.host;
+    // 2) Redirect call to play AI reply & resume streaming
     const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say(aiText, { voice:'alice' });
-    twiml.connect().stream({ url:`wss://${host}/stream?callSid=${encodeURIComponent(callSid)}` });
-    twiml.pause({ length:60 });
+    twiml.say(aiText, { voice: 'alice', bargeIn: true });
+    twiml.connect().stream({ url: `wss://${host}/stream?callSid=${encodeURIComponent(callSid)}` });
+    twiml.pause({ length: 60 });
 
     try {
       await twClient.calls(callSid).update({ twiml: twiml.toString() });
